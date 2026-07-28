@@ -3,6 +3,7 @@ FROM python:3.11-slim
 # System packages required to build dlib (face_recognition's dependency)
 # and to run OpenCV/MediaPipe on a headless server.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
     build-essential \
     cmake \
     libgl1 \
@@ -13,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenblas-dev \
     liblapack-dev \
     && rm -rf /var/lib/apt/lists/*
-
+    
 WORKDIR /app
 
 COPY requirements.txt .
