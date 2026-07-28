@@ -26,4 +26,4 @@ COPY . .
 RUN mkdir -p registered_faces session_reports
 
 EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
