@@ -74,9 +74,10 @@ import statistics
 import numpy as np
 import cv2
 from collections import defaultdict, deque
-from deepface import DeepFace
 import mediapipe as mp
 
+# add:
+from emotion import predict_emotion_full
 
 class ExtendedMoodClassroomMonitor:
 
@@ -164,7 +165,7 @@ class ExtendedMoodClassroomMonitor:
         self.person_calib_buffers = defaultdict(lambda: {f: [] for f in self.calib_features})
         self.person_baseline = {}
 
-        self._deepface_fail_count = 0
+        self._emotion_fail_count = 0
 
         self.tracks = {}
         self._next_track_id = 0
@@ -406,24 +407,18 @@ class ExtendedMoodClassroomMonitor:
         return track["name"]
 
     def _analyze_emotions_for_face(self, face_bgr):
-        face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-        for backend in ("skip", "opencv"):
-            try:
-                analysis = DeepFace.analyze(face_rgb, actions=["emotion"],
-                                             enforce_detection=False, detector_backend=backend)
-                if isinstance(analysis, list) and len(analysis) > 0:
-                    analysis = analysis[0]
-                emotions = analysis.get("emotion") or analysis.get("emotions")
-                if emotions is None:
-                    continue
-                result = {k: float(emotions.get(k, 0.0)) for k in self.emotion_keys}
-                total = sum(result.values())
-                if not (50 <= total <= 150):
-                    continue
-                return result
-            except Exception:
-                self._deepface_fail_count += 1
-        return None
+        try:
+            result = predict_emotion_full(face_bgr)
+            total = sum(result.values())
+            if not (50 <= total <= 150):
+                return None
+            return result
+        except Exception:
+            self._emotion_fail_count += 1
+            return None
+        except Exception:
+            self._emotion_fail_count += 1
+            return None
 
     def _update_smoothed_emotions(self, name, current):
         self.person_temporal_context[name].append(current.copy())
