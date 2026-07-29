@@ -24,7 +24,16 @@ RUN pip install --no-cache-dir \
     matplotlib==3.9.2
 
 RUN pip install --no-cache-dir opencv-python-headless==4.10.0.84
-RUN pip install --no-cache-dir dlib-bin==19.24.6 face_recognition==1.3.0
+
+# dlib-bin provides the same `dlib` module as the real `dlib` package,
+# but under a different pip name — install it alone first.
+RUN pip install --no-cache-dir dlib-bin==19.24.6
+
+# --no-deps is essential: face_recognition's metadata lists "dlib" (not
+# "dlib-bin") as a dependency, which would otherwise make pip try to
+# build the real dlib from source and fail (no compiler installed here).
+RUN pip install --no-cache-dir --no-deps face_recognition==1.3.0
+
 RUN pip install --no-cache-dir git+https://github.com/ageitgey/face_recognition_models
 RUN pip install --no-cache-dir protobuf==4.25.3 mediapipe==0.10.14
 RUN pip install --no-cache-dir onnxruntime==1.19.2
