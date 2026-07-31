@@ -3,6 +3,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   BarChart, Bar, Cell, PieChart, Pie, Sector
 } from 'recharts'
+import { apiPost, apiGet } from './api'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 type Screen =
@@ -486,160 +487,153 @@ function HomeScreen({ onNav, onScreen, dark }: { onNav: (t: NavTab) => void; onS
 
 // ─── Screen: Face Registration ────────────────────────────────────────────────
 function RegistrationScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
-  const [step, setStep] = useState<'capture' | 'review'>('capture')
-  const [angle, setAngle] = useState(4)
-  const total = 15
-  const pct = (angle / total) * 100
-  const r = 38, circ = 2 * Math.PI * r
-  const captured = Array.from({ length: angle - 1 })
-  const guides = ['Look straight ahead', 'Tilt slightly left', 'Tilt right', 'Look up slightly', 'Natural expression']
-  const guide = guides[(angle - 1) % guides.length]
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const [studentName, setStudentName] = useState('')
+  const [capturedBlobs, setCapturedBlobs] = useState<Blob[]>([])
+  const [step, setStep] = useState<'name' | 'capture' | 'review' | 'saving' | 'done'>('name')
+  const [error, setError] = useState<string | null>(null)
+  const total = 8 // fewer than the original 15 — plenty for good recognition, faster to test
 
-  if (step === 'review') return (
+  useEffect(() => {
+    if (step !== 'capture') return
+    let stream: MediaStream
+    navigator.mediaDevices.getUserMedia({ video: true })
+      .then(s => { stream = s; if (videoRef.current) videoRef.current.srcObject = s })
+      .catch(() => setError('Camera access denied. Please allow camera permissions.'))
+    return () => { stream?.getTracks().forEach(t => t.stop()) }
+  }, [step])
+
+  function captureFrame() {
+    const video = videoRef.current
+    const canvas = canvasRef.current
+    if (!video || !canvas || video.videoWidth === 0) return
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+    canvas.getContext('2d')?.drawImage(video, 0, 0)
+    canvas.toBlob(blob => {
+      if (blob) setCapturedBlobs(prev => [...prev, blob])
+    }, 'image/jpeg', 0.9)
+  }
+
+  async function handleSave() {
+    setStep('saving')
+    const form = new FormData()
+    form.append('name', studentName)
+    capturedBlobs.forEach((blob, i) => form.append('images', blob, `angle_${i}.jpg`))
+    try {
+      await apiPost('/api/students/register', form)
+      setStep('done')
+    } catch (e) {
+      setError('Failed to save. Check that the backend is running.')
+      setStep('review')
+    }
+  }
+
+  if (step === 'name') return (
+    <div className="phone-scroll" style={{ flex: 1, padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <button onClick={onBack} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4 }}>
+          {icons.chevronLeft(dark ? '#e2edf6' : '#1a2b3c')}
+        </button>
+        <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Register student</h2>
+      </div>
+      <label style={{ fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4' }}>STUDENT NAME</label>
+      <input value={studentName} onChange={e => setStudentName(e.target.value)}
+        placeholder="e.g. Amara Diallo"
+        style={{
+          padding: '13px 16px', borderRadius: 12, border: `1.5px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
+          background: dark ? '#1a2e40' : '#f8fbfe', fontSize: 15, color: dark ? '#e2edf6' : '#1a2b3c',
+          fontFamily: 'Manrope, sans-serif', fontWeight: 500,
+        }} />
+      <button onClick={() => studentName.trim() && setStep('capture')} disabled={!studentName.trim()} style={{
+        padding: '15px', borderRadius: 14,
+        background: studentName.trim() ? 'linear-gradient(135deg, #3d84a8, #5bb8a0)' : (dark ? '#2a4458' : '#d4e4ef'),
+        border: 'none', color: 'white', fontSize: 16, fontWeight: 700,
+        cursor: studentName.trim() ? 'pointer' : 'not-allowed',
+      }}>Start capture</button>
+    </div>
+  )
+
+  if (step === 'review' || step === 'saving' || step === 'done') return (
     <div className="phone-scroll" style={{ flex: 1, padding: '16px 20px', display: 'flex', flexDirection: 'column' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
         <button onClick={() => setStep('capture')} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4 }}>
           {icons.chevronLeft(dark ? '#e2edf6' : '#1a2b3c')}
         </button>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Review photos</h2>
-          <p style={{ margin: 0, fontSize: 12, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>Check all angles look clear</p>
-        </div>
+        <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>
+          {step === 'done' ? 'Registered!' : 'Review photos'}
+        </h2>
       </div>
 
+      {error && <div style={{ color: '#e8b86d', fontSize: 13, marginBottom: 12 }}>{error}</div>}
+
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 20 }}>
-        {Array.from({ length: total }).map((_, i) => (
-          <div key={i} style={{
-            aspectRatio: '3/4', borderRadius: 12, overflow: 'hidden',
-            background: dark ? '#1a2e40' : '#e8f0f8',
-            border: `1.5px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
-            position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}>
-            <div style={{ fontSize: 22 }}>😊</div>
-            <div style={{
-              position: 'absolute', bottom: 4, right: 4,
-              background: '#5bb8a0', borderRadius: 6, padding: '1px 5px',
-              fontSize: 9, fontWeight: 700, color: 'white',
-            }}>{i + 1}</div>
-            {i === 6 && (
-              <button style={{
-                position: 'absolute', top: 4, right: 4,
-                background: 'rgba(0,0,0,0.3)', border: 'none', borderRadius: 6,
-                color: 'white', fontSize: 10, fontWeight: 700, cursor: 'pointer', padding: '2px 5px',
-              }}>↺</button>
-            )}
-          </div>
+        {capturedBlobs.map((blob, i) => (
+          <img key={i} src={URL.createObjectURL(blob)} style={{ width: '100%', aspectRatio: '3/4', objectFit: 'cover', borderRadius: 12 }} />
         ))}
       </div>
 
-      <div style={{ display: 'flex', gap: 10 }}>
-        <button onClick={() => setStep('capture')} style={{
-          flex: 1, padding: '13px', borderRadius: 12,
-          background: 'none', border: `1.5px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
-          color: dark ? '#e2edf6' : '#1a2b3c', fontSize: 14, fontWeight: 700, cursor: 'pointer',
-        }}>Retake some</button>
-        <button style={{
-          flex: 2, padding: '13px', borderRadius: 12,
-          background: 'linear-gradient(135deg, #3d84a8, #5bb8a0)',
+      {step === 'done' ? (
+        <button onClick={onBack} style={{
+          padding: '13px', borderRadius: 12, background: 'linear-gradient(135deg, #3d84a8, #5bb8a0)',
           border: 'none', color: 'white', fontSize: 14, fontWeight: 700, cursor: 'pointer',
-        }}>Confirm &amp; Save</button>
-      </div>
+        }}>Done → Back home</button>
+      ) : (
+        <button onClick={handleSave} disabled={step === 'saving'} style={{
+          padding: '13px', borderRadius: 12, background: 'linear-gradient(135deg, #3d84a8, #5bb8a0)',
+          border: 'none', color: 'white', fontSize: 14, fontWeight: 700,
+          cursor: step === 'saving' ? 'default' : 'pointer', opacity: step === 'saving' ? 0.6 : 1,
+        }}>{step === 'saving' ? 'Saving...' : 'Confirm & Save'}</button>
+      )}
     </div>
   )
 
+  // step === 'capture'
+  const pct = (capturedBlobs.length / total) * 100
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-      {/* Header */}
       <div style={{ padding: '10px 20px 12px', display: 'flex', alignItems: 'center', gap: 10 }}>
         <button onClick={onBack} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4 }}>
           {icons.chevronLeft(dark ? '#e2edf6' : '#1a2b3c')}
         </button>
         <div>
-          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Register student</h2>
-          <p style={{ margin: 0, fontSize: 12, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>Amara Diallo · Year 10</p>
+          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Capture angles</h2>
+          <p style={{ margin: 0, fontSize: 12, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>{studentName}</p>
         </div>
       </div>
 
-      {/* Camera preview */}
       <div style={{
         margin: '0 20px', borderRadius: 20, overflow: 'hidden',
-        background: dark ? '#0a1825' : '#1a2b3c',
-        aspectRatio: '3/4', position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        background: '#1a2b3c', aspectRatio: '3/4', position: 'relative',
       }}>
-        {/* Simulated face */}
-        <div style={{ fontSize: 80, opacity: 0.6 }}>😊</div>
-        {/* Face oval guide */}
-        <div style={{
-          position: 'absolute', top: '50%', left: '50%',
-          transform: 'translate(-50%, -50%)',
-          width: 160, height: 200,
-          border: '2px solid rgba(91,184,160,0.7)',
-          borderRadius: '50%',
-        }} />
-        {/* Progress ring overlay */}
-        <div style={{ position: 'absolute', top: 14, right: 14 }}>
-          <svg width="90" height="90">
-            <circle cx="45" cy="45" r={r} fill="rgba(0,0,0,0.35)" stroke="rgba(255,255,255,0.12)" strokeWidth="6" />
-            <circle cx="45" cy="45" r={r} fill="none" stroke="rgba(255,255,255,0.18)" strokeWidth="6" />
-            <circle cx="45" cy="45" r={r} fill="none"
-              stroke="#5bb8a0" strokeWidth="6" strokeLinecap="round"
-              strokeDasharray={`${circ * pct / 100} ${circ}`}
-              strokeDashoffset={circ * 0.25}
-              transform="rotate(-90 45 45)"
-            />
-            <text x="45" y="42" textAnchor="middle" fill="white" fontSize="13" fontWeight="700" fontFamily="Manrope">
-              {angle}/{total}
-            </text>
-            <text x="45" y="55" textAnchor="middle" fill="rgba(255,255,255,0.6)" fontSize="9" fontFamily="Manrope">
-              angles
-            </text>
-          </svg>
-        </div>
-        {/* Guidance */}
+        <video ref={videoRef} autoPlay playsInline muted
+          style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+        <canvas ref={canvasRef} style={{ display: 'none' }} />
+        {error && (
+          <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#e8b86d', fontSize: 13, textAlign: 'center', padding: 20 }}>
+            {error}
+          </div>
+        )}
         <div style={{
           position: 'absolute', bottom: 14, left: '50%', transform: 'translateX(-50%)',
           background: 'rgba(0,0,0,0.55)', borderRadius: 20, padding: '8px 18px',
-          color: 'white', fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap',
-          backdropFilter: 'blur(8px)',
-        }}>
-          {guide}
-        </div>
+          color: 'white', fontSize: 13, fontWeight: 600,
+        }}>{capturedBlobs.length}/{total} captured</div>
       </div>
 
-      {/* Capture strip */}
       <div style={{ padding: '14px 20px', display: 'flex', alignItems: 'center', gap: 10 }}>
-        <div style={{ display: 'flex', gap: 4, flex: 1, overflowX: 'auto' }}>
-          {captured.map((_, i) => (
-            <div key={i} style={{
-              width: 36, height: 46, borderRadius: 8, flexShrink: 0,
-              background: dark ? '#1a2e40' : '#d4e4ef',
-              border: `1.5px solid ${dark ? '#2a4458' : '#b0cfe0'}`,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 16,
-            }}>😊</div>
-          ))}
-          {/* Current slot */}
-          <div style={{
-            width: 36, height: 46, borderRadius: 8, flexShrink: 0,
-            border: '2px dashed #5bb8a0',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            animation: 'pulse 1.5s ease-in-out infinite',
-          }}>
-            <div style={{ width: 6, height: 6, borderRadius: 3, background: '#5bb8a0' }} />
-          </div>
-        </div>
-        <button onClick={() => { if (angle < total) setAngle(a => a + 1); else setStep('review'); }} style={{
+        <button onClick={captureFrame} disabled={capturedBlobs.length >= total} style={{
           width: 52, height: 52, borderRadius: 26,
           background: 'linear-gradient(135deg, #3d84a8, #5bb8a0)',
-          border: '3px solid white', boxShadow: '0 4px 16px rgba(91,184,160,0.4)',
-          cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-          flexShrink: 0,
+          border: '3px solid white', cursor: 'pointer',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto',
         }}>
-          {angle >= total ? icons.check('white') : <div style={{ width: 16, height: 16, borderRadius: 8, background: 'white' }} />}
+          <div style={{ width: 16, height: 16, borderRadius: 8, background: 'white' }} />
         </button>
       </div>
 
-      {angle >= total && (
+      {capturedBlobs.length >= total && (
         <div style={{ padding: '0 20px 16px' }}>
           <button onClick={() => setStep('review')} style={{
             width: '100%', padding: '13px', borderRadius: 12,
@@ -654,41 +648,104 @@ function RegistrationScreen({ onBack, dark }: { onBack: () => void; dark: boolea
 
 // ─── Screen: Attendance ───────────────────────────────────────────────────────
 function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [presentStudents, setPresentStudents] = useState<Set<string>>(new Set())
+  const [seconds, setSeconds] = useState(0)
   const [sheetOpen, setSheetOpen] = useState(false)
-  const [seconds, setSeconds] = useState(142)
+  const [error, setError] = useState<string | null>(null)
+
+  // 1. Start camera + backend session when screen opens
+  useEffect(() => {
+    let stream: MediaStream
+
+    async function init() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true })
+        if (videoRef.current) videoRef.current.srcObject = stream
+      } catch (e) {
+        setError('Camera access denied. Please allow camera permissions.')
+        return
+      }
+
+      const form = new FormData()
+      form.append('class_name', 'Year 10 Science')
+      const data = await apiPost('/api/attendance/start', form)
+      setSessionId(data.session_id)
+    }
+    init()
+
+    return () => { stream?.getTracks().forEach(t => t.stop()) }
+  }, [])
+
+  // 2. Timer for the on-screen clock
   useEffect(() => {
     const t = setInterval(() => setSeconds(s => s + 1), 1000)
     return () => clearInterval(t)
   }, [])
+
+  // 3. Grab a frame + send it every 800ms, once we have a session
+  useEffect(() => {
+    if (!sessionId) return
+    const interval = setInterval(async () => {
+      const video = videoRef.current
+      const canvas = canvasRef.current
+      if (!video || !canvas || video.videoWidth === 0) return
+
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
+      const ctx = canvas.getContext('2d')
+      ctx?.drawImage(video, 0, 0)
+
+      canvas.toBlob(async (blob) => {
+        if (!blob) return
+        const form = new FormData()
+        form.append('session_id', sessionId)
+        form.append('image', blob, 'frame.jpg')
+        try {
+          const result = await apiPost('/api/attendance/frame', form)
+          if (result.name && result.name !== 'Unknown') {
+            setPresentStudents(prev => new Set(prev).add(result.name))
+          }
+        } catch (e) { /* skip failed frame, try again next tick */ }
+      }, 'image/jpeg', 0.8)
+    }, 800)
+    return () => clearInterval(interval)
+  }, [sessionId])
+
+  async function handleEnd() {
+    if (sessionId) {
+      const form = new FormData()
+      form.append('session_id', sessionId)
+      await apiPost('/api/attendance/end', form)
+    }
+    onBack()
+  }
+
   const mins = Math.floor(seconds / 60)
   const secs = seconds % 60
-  const present = STUDENTS.slice(0, 6)
-  const boxes = [
-    { x: 40, y: 90, w: 90, h: 115, name: 'Amara D.', conf: 98 },
-    { x: 160, y: 75, w: 95, h: 120, name: 'Ben H.', conf: 94 },
-    { x: 52, y: 230, w: 88, h: 112, name: 'Cleo N.', conf: 97 },
-    { x: 170, y: 220, w: 92, h: 118, name: 'Dani O.', conf: 91 },
-  ]
+
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative' }}>
-      {/* Full-screen camera */}
       <div style={{ flex: 1, background: '#0a1520', position: 'relative', overflow: 'hidden' }}>
-        {/* Simulated camera feed */}
-        <div style={{
-          position: 'absolute', inset: 0,
-          background: 'linear-gradient(160deg, #0f2235 0%, #1a3048 50%, #0f2235 100%)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}>
-          <div style={{ fontSize: 90, opacity: 0.12 }}>👥</div>
-        </div>
+        {/* REAL camera feed, replacing the fake gradient div */}
+        <video ref={videoRef} autoPlay playsInline muted
+          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }} />
+        <canvas ref={canvasRef} style={{ display: 'none' }} />
 
-        {/* Top bar */}
+        {error && (
+          <div style={{ position: 'absolute', top: 60, left: 16, right: 16, background: 'rgba(200,50,50,0.9)', color: 'white', padding: 12, borderRadius: 10, fontSize: 13 }}>
+            {error}
+          </div>
+        )}
+
         <div style={{
           position: 'absolute', top: 0, left: 0, right: 0,
           padding: '10px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
           background: 'linear-gradient(to bottom, rgba(0,0,0,0.55), transparent)',
         }}>
-          <button onClick={onBack} style={{
+          <button onClick={handleEnd} style={{
             background: 'rgba(255,255,255,0.15)', border: 'none', borderRadius: 10,
             padding: '6px 10px', cursor: 'pointer', backdropFilter: 'blur(8px)',
             display: 'flex', alignItems: 'center', gap: 4, color: 'white', fontSize: 13, fontWeight: 600,
@@ -697,8 +754,7 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
           </button>
           <div style={{
             background: 'rgba(0,0,0,0.4)', borderRadius: 20, padding: '5px 14px',
-            display: 'flex', alignItems: 'center', gap: 6,
-            backdropFilter: 'blur(8px)',
+            display: 'flex', alignItems: 'center', gap: 6, backdropFilter: 'blur(8px)',
           }}>
             <div style={{ width: 7, height: 7, borderRadius: 4, background: '#5bb8a0', animation: 'pulse 1.5s ease-in-out infinite' }} />
             <span style={{ color: 'white', fontSize: 13, fontWeight: 700 }}>
@@ -709,27 +765,10 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
             background: 'rgba(0,0,0,0.4)', borderRadius: 10, padding: '5px 12px',
             color: 'white', fontSize: 12, fontWeight: 700, backdropFilter: 'blur(8px)',
           }}>
-            {present.length}/28
+            {presentStudents.size}
           </div>
         </div>
 
-        {/* Bounding boxes */}
-        <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }} viewBox="0 0 340 480" preserveAspectRatio="xMidYMid slice">
-          {boxes.map(({ x, y, w, h, name, conf }) => (
-            <g key={name}>
-              <rect x={x} y={y} width={w} height={h} rx="8" ry="8"
-                fill="none" stroke="#5bb8a0" strokeWidth="1.8" opacity="0.85" />
-              <rect x={x} y={y + h - 24} width={w} height={24} rx="0" ry="0"
-                fill="rgba(91,184,160,0.7)" />
-              <rect x={x} y={y + h - 24} width={w} height={24} rx="8" ry="8"
-                fill="rgba(91,184,160,0)" />
-              <text x={x + 6} y={y + h - 9} fontSize="10" fill="white" fontFamily="Manrope" fontWeight="700">{name}</text>
-              <text x={x + w - 6} y={y + h - 9} fontSize="9" fill="rgba(255,255,255,0.8)" fontFamily="Manrope" textAnchor="end">{conf}%</text>
-            </g>
-          ))}
-        </svg>
-
-        {/* Bottom sheet trigger */}
         <button onClick={() => setSheetOpen(!sheetOpen)} style={{
           position: 'absolute', bottom: 0, left: 0, right: 0,
           background: 'none', border: 'none', cursor: 'pointer', padding: 0,
@@ -737,22 +776,20 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
           <div style={{
             background: dark ? 'rgba(22,37,53,0.96)' : 'rgba(240,246,252,0.96)',
             borderTopLeftRadius: 24, borderTopRightRadius: 24,
-            padding: '10px 20px 12px',
-            backdropFilter: 'blur(12px)',
+            padding: '10px 20px 12px', backdropFilter: 'blur(12px)',
           }}>
             <div style={{ width: 32, height: 4, borderRadius: 2, background: dark ? '#4a6880' : '#b0c8d8', margin: '0 auto 8px' }} />
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <span style={{ fontSize: 13, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c' }}>
-                {present.length} present · 2 absent · 20 pending
+                {presentStudents.size} present
               </span>
               <span style={{ fontSize: 12, color: '#5bb8a0', fontWeight: 700 }}>{sheetOpen ? '↓' : '↑'} Details</span>
             </div>
             {sheetOpen && (
               <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 200, overflowY: 'auto' }}>
-                {present.map(s => (
-                  <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                    <AvatarDot student={s} size={30} />
-                    <span style={{ fontSize: 13, fontWeight: 600, color: dark ? '#e2edf6' : '#1a2b3c', flex: 1 }}>{s.name}</span>
+                {[...presentStudents].map(name => (
+                  <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: dark ? '#e2edf6' : '#1a2b3c', flex: 1 }}>{name}</span>
                     <span style={{ fontSize: 11, fontWeight: 700, color: '#5bb8a0' }}>Present</span>
                   </div>
                 ))}
@@ -767,40 +804,141 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
 
 // ─── Screen: Mood Monitor ─────────────────────────────────────────────────────
 function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
-  const detections = [
-    { x: 38, y: 80, w: 90, name: 'Amara D.', attention: 'Focused', mood: 'Calm', flag: false },
-    { x: 155, y: 65, w: 95, name: 'Ben H.', attention: 'Distracted', mood: 'Sleepy', flag: true },
-    { x: 50, y: 220, w: 88, name: 'Cleo N.', attention: 'Focused', mood: 'Curious', flag: false },
-    { x: 168, y: 215, w: 92, name: 'Dani O.', attention: 'Sleepy', mood: 'Distracted', flag: true },
-  ]
-  const attentionColor = (a: string) => a === 'Focused' ? '#5bb8a0' : a === 'Distracted' ? '#e8b86d' : '#b8a0c8'
-  const moodColor = (m: string) => MOOD_COLORS[m] ?? '#8fa8c8'
-  const engagementPct = 0.71
-  const donutData = [
-    { name: 'Focused', value: 45, fill: '#5bb8a0' },
-    { name: 'Calm', value: 20, fill: '#3d84a8' },
-    { name: 'Distracted', value: 25, fill: '#e8b86d' },
-    { name: 'Sleepy', value: 10, fill: '#b8a0c8' },
-  ]
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [videoDims, setVideoDims] = useState({ w: 340, h: 480 })
+  const [faces, setFaces] = useState<any[]>([])
+  const [seconds, setSeconds] = useState(0)
+  const [error, setError] = useState<string | null>(null)
+
+  // Rolling history so the donut/legend reflect the whole session, not just this instant
+  const attentionCounts = useRef<Record<string, number>>({})
+  const moodCounts = useRef<Record<string, number>>({})
+  const loadSamples = useRef<number[]>([])
+  const [, forceUpdate] = useState(0) // re-render when refs change
+
+  const CALIBRATION_SECONDS = 25
+
+  // 1. Camera + backend session
+  useEffect(() => {
+    let stream: MediaStream
+    async function init() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true })
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream
+          videoRef.current.onloadedmetadata = () => {
+            setVideoDims({ w: videoRef.current!.videoWidth, h: videoRef.current!.videoHeight })
+          }
+        }
+      } catch {
+        setError('Camera access denied. Please allow camera permissions.')
+        return
+      }
+      const data = await apiPost('/api/mood/start', new FormData())
+      setSessionId(data.session_id)
+    }
+    init()
+    return () => { stream?.getTracks().forEach(t => t.stop()) }
+  }, [])
+
+  // 2. Session clock
+  useEffect(() => {
+    const t = setInterval(() => setSeconds(s => s + 1), 1000)
+    return () => clearInterval(t)
+  }, [])
+
+  // 3. Frame capture loop — sends a frame roughly every 700ms.
+  // Over the 25s calibration window that's ~35 frames, comfortably
+  // above the backend's 20-sample minimum for locking in personal
+  // baselines (smile, eyebrow tension, eye/mouth openness).
+  useEffect(() => {
+    if (!sessionId) return
+    const interval = setInterval(async () => {
+      const video = videoRef.current
+      const canvas = canvasRef.current
+      if (!video || !canvas || video.videoWidth === 0) return
+
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
+      canvas.getContext('2d')?.drawImage(video, 0, 0)
+
+      canvas.toBlob(async (blob) => {
+        if (!blob) return
+        const form = new FormData()
+        form.append('session_id', sessionId)
+        form.append('image', blob, 'frame.jpg')
+        try {
+          const result = await apiPost('/api/mood/frame', form)
+          const newFaces = result.faces || []
+          setFaces(newFaces)
+
+          // Accumulate session-wide stats for the donut + legend
+          for (const f of newFaces) {
+            attentionCounts.current[f.attentiveness] = (attentionCounts.current[f.attentiveness] || 0) + 1
+            moodCounts.current[f.mood] = (moodCounts.current[f.mood] || 0) + 1
+            loadSamples.current.push(f.cognitive_load)
+            if (loadSamples.current.length > 200) loadSamples.current.shift()
+          }
+          forceUpdate(n => n + 1)
+        } catch { /* skip failed frame */ }
+      }, 'image/jpeg', 0.8)
+    }, 700)
+    return () => clearInterval(interval)
+  }, [sessionId])
+
+  async function handleDone() {
+    if (sessionId) {
+      const form = new FormData()
+      form.append('session_id', sessionId)
+      await apiPost('/api/mood/end', form)
+    }
+    onBack()
+  }
+
+  const isCalibrating = seconds < CALIBRATION_SECONDS
+  const avgLoad = loadSamples.current.length
+    ? loadSamples.current.reduce((a, b) => a + b, 0) / loadSamples.current.length
+    : 0
+
+  const attentionColor = (a: string) =>
+    a === 'attentive' || a === 'focused' ? '#5bb8a0'
+    : a === 'distracted' || a === 'looking_away' ? '#e8b86d'
+    : '#b8a0c8' // sleepy, yawning
+  const moodColorFor = (m: string) => ({
+    happy: '#5bb8a0', neutral: '#8fa8c8', confused: '#e8b86d', furrowed: '#d4a050',
+    sad: '#b8a0c8', surprised: '#7ab8d4', angry: '#c8907a', fearful: '#c8a8d0',
+  } as Record<string, string>)[m] ?? '#8fa8c8'
+
+  // Donut built from real accumulated attentiveness counts
+  const donutTotal = Object.values(attentionCounts.current).reduce((a, b) => a + b, 0)
+  const donutData = Object.entries(attentionCounts.current).map(([name, value]) => ({
+    name, value, fill: attentionColor(name),
+  }))
+
+  const worthCheckIn = !isCalibrating && avgLoad >= 55
+
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative' }}>
       <div style={{ flex: 1, background: '#0a1520', position: 'relative', overflow: 'hidden' }}>
-        {/* Camera bg */}
-        <div style={{
-          position: 'absolute', inset: 0,
-          background: 'linear-gradient(160deg, #0f2235, #1a3048 50%, #0f2235)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}>
-          <div style={{ fontSize: 90, opacity: 0.10 }}>👥</div>
-        </div>
+        <video ref={videoRef} autoPlay playsInline muted
+          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }} />
+        <canvas ref={canvasRef} style={{ display: 'none' }} />
+
+        {error && (
+          <div style={{ position: 'absolute', top: 60, left: 16, right: 16, background: 'rgba(200,50,50,0.9)', color: 'white', padding: 12, borderRadius: 10, fontSize: 13, zIndex: 5 }}>
+            {error}
+          </div>
+        )}
 
         {/* Top bar */}
         <div style={{
           position: 'absolute', top: 0, left: 0, right: 0,
           padding: '10px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          background: 'linear-gradient(to bottom, rgba(0,0,0,0.55), transparent)',
+          background: 'linear-gradient(to bottom, rgba(0,0,0,0.55), transparent)', zIndex: 4,
         }}>
-          <button onClick={onBack} style={{
+          <button onClick={handleDone} style={{
             background: 'rgba(255,255,255,0.15)', border: 'none', borderRadius: 10,
             padding: '6px 10px', cursor: 'pointer', backdropFilter: 'blur(8px)',
             color: 'white', fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4,
@@ -811,96 +949,97 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
             background: 'rgba(0,0,0,0.4)', borderRadius: 20, padding: '5px 14px',
             backdropFilter: 'blur(8px)', color: 'white', fontSize: 13, fontWeight: 700,
           }}>
-            Mood Monitor · Live
+            {isCalibrating ? `Calibrating ${seconds}/${CALIBRATION_SECONDS}s` : 'Mood Monitor · Live'}
           </div>
         </div>
 
-        {/* SVG overlays */}
-        <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }} viewBox="0 0 340 480" preserveAspectRatio="xMidYMid slice">
-          {detections.map(({ x, y, w, name, attention, mood, flag }) => (
-            <g key={name}>
-              {/* Face box */}
-              <rect x={x} y={y + 38} width={w} height={w * 1.2} rx="8" fill="none"
-                stroke={attentionColor(attention)} strokeWidth="1.5" opacity="0.7" />
-              {/* Attention bar */}
-              <rect x={x} y={y + 12} width={w} height={12} rx="6" fill="rgba(0,0,0,0.45)" />
-              <rect x={x} y={y + 12} width={w * (attention === 'Focused' ? 0.82 : attention === 'Distracted' ? 0.45 : 0.25)} height={12} rx="6"
-                fill={attentionColor(attention)} opacity="0.9" />
-              <text x={x + 6} y={y + 22} fontSize="7.5" fill="white" fontFamily="Manrope" fontWeight="700">{attention}</text>
-              {/* Mood bar */}
-              <rect x={x} y={y + 26} width={w} height={10} rx="5" fill="rgba(0,0,0,0.35)" />
-              <rect x={x} y={y + 26} width={w * 0.6} height={10} rx="5"
-                fill={moodColor(mood)} opacity="0.85" />
-              <text x={x + 6} y={y + 34} fontSize="7" fill="rgba(255,255,255,0.85)" fontFamily="Manrope" fontWeight="600">{mood}</text>
-              {/* Flag dot */}
-              {flag && <circle cx={x + w - 5} cy={y + 12} r="6" fill="#e8b86d" opacity="0.95" />}
-              {/* Name */}
-              <rect x={x} y={y + 38 + w * 1.2 - 18} width={w} height={18} rx="0" fill="rgba(0,0,0,0.4)" />
-              <text x={x + 5} y={y + 38 + w * 1.2 - 6} fontSize="9" fill="white" fontFamily="Manrope" fontWeight="700">{name}</text>
-            </g>
-          ))}
+        {/* Real detection overlays, scaled to actual camera resolution */}
+        <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', zIndex: 3 }}
+          viewBox={`0 0 ${videoDims.w} ${videoDims.h}`} preserveAspectRatio="xMidYMid slice">
+          {faces.map((f, i) => {
+            const { x, y, w, h } = f.box
+            const barW = w
+            return (
+              <g key={i}>
+                <rect x={x} y={y} width={w} height={h} rx="8" fill="none"
+                  stroke={attentionColor(f.attentiveness)} strokeWidth="2" opacity="0.85" />
+                <rect x={x} y={y - 34} width={barW} height={12} rx="6" fill="rgba(0,0,0,0.45)" />
+                <rect x={x} y={y - 34} width={barW * (f.attentiveness_confidence / 100)} height={12} rx="6"
+                  fill={attentionColor(f.attentiveness)} opacity="0.9" />
+                <text x={x + 6} y={y - 25} fontSize="10" fill="white" fontFamily="Manrope" fontWeight="700">
+                  {f.attentiveness}
+                </text>
+                <rect x={x} y={y - 20} width={barW} height={10} rx="5" fill="rgba(0,0,0,0.35)" />
+                <rect x={x} y={y - 20} width={barW * (f.mood_confidence / 100)} height={10} rx="5"
+                  fill={moodColorFor(f.mood)} opacity="0.85" />
+                <text x={x + 6} y={y - 12} fontSize="8" fill="rgba(255,255,255,0.9)" fontFamily="Manrope" fontWeight="600">
+                  {f.mood}
+                </text>
+                <rect x={x} y={y + h} width={barW} height={18} fill="rgba(0,0,0,0.4)" />
+                <text x={x + 5} y={y + h + 13} fontSize="10" fill="white" fontFamily="Manrope" fontWeight="700">
+                  {f.name} · load {Math.round(f.cognitive_load)}
+                </text>
+              </g>
+            )
+          })}
         </svg>
 
-        {/* Floating engagement donut */}
-        <div style={{
-          position: 'absolute', bottom: 90, right: 14,
-          background: 'rgba(0,0,0,0.55)', borderRadius: 16,
-          padding: '8px', backdropFilter: 'blur(10px)',
-          display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2,
-        }}>
-          <svg width="70" height="70">
-            <circle cx="35" cy="35" r="28" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="8" />
-            {donutData.reduce((acc, seg) => {
-              const total2 = donutData.reduce((s, d) => s + d.value, 0)
-              const offset = 2 * Math.PI * 28 * (acc.soFar / total2)
-              const dash = 2 * Math.PI * 28 * (seg.value / total2) - 2
-              const el = (
-                <circle key={seg.name} cx="35" cy="35" r="28" fill="none"
-                  stroke={seg.fill} strokeWidth="8" strokeLinecap="round"
-                  strokeDasharray={`${Math.max(0, dash)} ${2 * Math.PI * 28}`}
-                  strokeDashoffset={-offset + 2 * Math.PI * 28 * 0.25}
-                  transform="rotate(-90 35 35)"
-                />
-              )
-              return { soFar: acc.soFar + seg.value, els: [...acc.els, el] }
-            }, { soFar: 0, els: [] as JSX.Element[] }).els}
-            <text x="35" y="39" textAnchor="middle" fill="white" fontSize="13" fontWeight="800" fontFamily="Manrope">
-              {Math.round(engagementPct * 100)}%
-            </text>
-          </svg>
-          <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.7)', fontWeight: 700 }}>CLASS</span>
-        </div>
+        {/* Floating donut — real aggregated attentiveness distribution */}
+        {donutTotal > 0 && (
+          <div style={{
+            position: 'absolute', bottom: 90, right: 14, zIndex: 4,
+            background: 'rgba(0,0,0,0.55)', borderRadius: 16, padding: 8,
+            backdropFilter: 'blur(10px)', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2,
+          }}>
+            <svg width="70" height="70">
+              <circle cx="35" cy="35" r="28" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="8" />
+              {donutData.reduce((acc, seg) => {
+                const offset = 2 * Math.PI * 28 * (acc.soFar / donutTotal)
+                const dash = 2 * Math.PI * 28 * (seg.value / donutTotal) - 2
+                acc.els.push(
+                  <circle key={seg.name} cx="35" cy="35" r="28" fill="none"
+                    stroke={seg.fill} strokeWidth="8" strokeLinecap="round"
+                    strokeDasharray={`${Math.max(0, dash)} ${2 * Math.PI * 28}`}
+                    strokeDashoffset={-offset + 2 * Math.PI * 28 * 0.25}
+                    transform="rotate(-90 35 35)" />
+                )
+                return { soFar: acc.soFar + seg.value, els: acc.els }
+              }, { soFar: 0, els: [] as JSX.Element[] }).els}
+              <text x="35" y="39" textAnchor="middle" fill="white" fontSize="12" fontWeight="800" fontFamily="Manrope">
+                {Math.round(avgLoad)}
+              </text>
+            </svg>
+            <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.7)', fontWeight: 700 }}>AVG LOAD</span>
+          </div>
+        )}
 
-        {/* Legend */}
+        {/* Bottom legend */}
         <div style={{
-          position: 'absolute', bottom: 10, left: 0, right: 0,
+          position: 'absolute', bottom: 0, left: 0, right: 0, zIndex: 4,
           background: dark ? 'rgba(22,37,53,0.95)' : 'rgba(240,246,252,0.95)',
           borderTopLeftRadius: 20, borderTopRightRadius: 20,
           padding: '10px 16px', backdropFilter: 'blur(12px)',
         }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontSize: 12, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c' }}>Class engagement: 71%</span>
-            <div style={{ display: 'flex', gap: 4 }}>
-              {[{ label: 'Focused', col: '#5bb8a0' }, { label: 'Distracted', col: '#e8b86d' }, { label: 'Sleepy', col: '#b8a0c8' }].map(({ label, col }) => (
-                <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
-                  <div style={{ width: 7, height: 7, borderRadius: 4, background: col }} />
-                  <span style={{ fontSize: 9, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 600 }}>{label}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div style={{ marginTop: 6, display: 'flex', gap: 6, alignItems: 'center' }}>
-            <div style={{ width: 8, height: 8, borderRadius: 4, background: '#e8b86d' }} />
-            <span style={{ fontSize: 11, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>
-              2 students may benefit from a check-in
+            <span style={{ fontSize: 12, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c' }}>
+              {isCalibrating
+                ? 'Learning this face — keep it in frame'
+                : `Session avg cognitive load: ${Math.round(avgLoad)}`}
             </span>
           </div>
+          {worthCheckIn && (
+            <div style={{ marginTop: 6, display: 'flex', gap: 6, alignItems: 'center' }}>
+              <div style={{ width: 8, height: 8, borderRadius: 4, background: '#e8b86d' }} />
+              <span style={{ fontSize: 11, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>
+                Sustained load is elevated — may be worth a check-in
+              </span>
+            </div>
+          )}
         </div>
       </div>
     </div>
   )
 }
-
 // ─── Screen: Reports ──────────────────────────────────────────────────────────
 function ReportsScreen({ onStudent, dark }: { onStudent: (s: typeof STUDENTS[0]) => void; dark: boolean }) {
   const sorted = [...STUDENTS].sort((a, b) => b.engagementAvg - a.engagementAvg)
