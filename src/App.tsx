@@ -1041,22 +1041,52 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
   )
 }
 // ─── Screen: Reports ──────────────────────────────────────────────────────────
-function ReportsScreen({ onStudent, dark }: { onStudent: (s: typeof STUDENTS[0]) => void; dark: boolean }) {
-  const sorted = [...STUDENTS].sort((a, b) => b.engagementAvg - a.engagementAvg)
-  const maxEng = Math.max(...sorted.map(s => s.engagementAvg))
+function ReportsScreen({ onStudent, dark }: { onStudent: (s: any) => void; dark: boolean }) {
+  const [data, setData] = useState<{
+    students: { name: string; engagementAvg: number; flag: boolean }[]
+    avgEngagement: number | null
+    topPerformer: string | null
+    needsCheckIn: number
+    timeline: { t: string; engagement: number }[]
+  } | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    apiGet('/api/reports/summary')
+      .then(setData)
+      .catch(() => setData(null))
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (loading) {
+    return <div style={{ padding: 40, textAlign: 'center', color: dark ? '#7aa5c0' : '#6b8ba4' }}>Loading reports…</div>
+  }
+
+  if (!data || data.students.length === 0) {
+    return (
+      <div className="phone-scroll" style={{ flex: 1, padding: '16px 20px' }}>
+        <h2 style={{ margin: '0 0 2px', fontSize: 20, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Reports</h2>
+        <p style={{ marginTop: 20, fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4' }}>
+          No session data yet. Run a Mood Monitor session first — reports populate from real recorded sessions.
+        </p>
+      </div>
+    )
+  }
+
+  const maxEng = Math.max(...data.students.map(s => s.engagementAvg))
+
   return (
     <div className="phone-scroll" style={{ flex: 1, padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 16 }}>
       <div>
         <h2 style={{ margin: '0 0 2px', fontSize: 20, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Reports</h2>
-        <p style={{ margin: 0, fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>Year 10 Science · Today</p>
+        <p style={{ margin: 0, fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>All sessions</p>
       </div>
 
-      {/* Summary stats */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
         {[
-          { label: 'Avg Engagement', value: '76%', color: '#3d84a8' },
-          { label: 'Top Performer', value: 'Cleo N.', color: '#5bb8a0' },
-          { label: 'Needs Check-in', value: '3', color: '#e8b86d' },
+          { label: 'Avg Engagement', value: data.avgEngagement != null ? `${data.avgEngagement}%` : '—', color: '#3d84a8' },
+          { label: 'Top Performer', value: data.topPerformer ?? '—', color: '#5bb8a0' },
+          { label: 'Needs Check-in', value: String(data.needsCheckIn), color: '#e8b86d' },
         ].map(({ label, value, color }) => (
           <div key={label} style={{
             padding: '12px 10px', borderRadius: 14, textAlign: 'center',
@@ -1069,31 +1099,21 @@ function ReportsScreen({ onStudent, dark }: { onStudent: (s: typeof STUDENTS[0])
         ))}
       </div>
 
-      {/* Bar chart */}
-      <div style={{
-        padding: '16px', borderRadius: 16,
-        background: dark ? '#162535' : '#ffffff',
-        border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
-      }}>
+      <div style={{ padding: '16px', borderRadius: 16, background: dark ? '#162535' : '#ffffff', border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}` }}>
         <p style={{ margin: '0 0 12px', fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.3 }}>
           AVERAGE ENGAGEMENT PER STUDENT
         </p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {sorted.map(s => (
-            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}
+          {data.students.map(s => (
+            <div key={s.name} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}
               onClick={() => onStudent(s)}>
-              <AvatarDot student={s} size={26} />
               <div style={{ width: 54, fontSize: 11, fontWeight: 600, color: dark ? '#e2edf6' : '#1a2b3c', flexShrink: 0 }}>
                 {s.name.split(' ')[0]}
               </div>
               <div style={{ flex: 1, height: 10, borderRadius: 5, background: dark ? '#1a2e40' : '#eef3f8', overflow: 'hidden' }}>
                 <div style={{
-                  height: '100%', borderRadius: 5,
-                  width: `${(s.engagementAvg / maxEng) * 100}%`,
-                  background: s.flag
-                    ? 'linear-gradient(90deg, #e8b86d, #d4a050)'
-                    : 'linear-gradient(90deg, #3d84a8, #5bb8a0)',
-                  transition: 'width 0.6s ease',
+                  height: '100%', borderRadius: 5, width: `${(s.engagementAvg / maxEng) * 100}%`,
+                  background: s.flag ? 'linear-gradient(90deg, #e8b86d, #d4a050)' : 'linear-gradient(90deg, #3d84a8, #5bb8a0)',
                 }} />
               </div>
               <div style={{ width: 32, fontSize: 12, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c', textAlign: 'right' }}>
@@ -1105,28 +1125,22 @@ function ReportsScreen({ onStudent, dark }: { onStudent: (s: typeof STUDENTS[0])
         </div>
       </div>
 
-      {/* Session line chart */}
-      <div style={{
-        padding: '16px', borderRadius: 16,
-        background: dark ? '#162535' : '#ffffff',
-        border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
-      }}>
-        <p style={{ margin: '0 0 12px', fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.3 }}>
-          CLASS ENGAGEMENT OVER SESSION
-        </p>
-        <ResponsiveContainer width="100%" height={110}>
-          <LineChart data={SESSION_TIMELINE} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke={dark ? '#2a4458' : '#e8f0f8'} />
-            <XAxis dataKey="t" tick={{ fontSize: 10, fill: dark ? '#7aa5c0' : '#6b8ba4', fontFamily: 'Manrope' }} />
-            <YAxis domain={[60, 100]} tick={{ fontSize: 10, fill: dark ? '#7aa5c0' : '#6b8ba4', fontFamily: 'Manrope' }} />
-            <Tooltip
-              contentStyle={{ background: dark ? '#162535' : '#fff', border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`, borderRadius: 8, fontSize: 12, fontFamily: 'Manrope' }}
-              labelStyle={{ color: dark ? '#e2edf6' : '#1a2b3c', fontWeight: 700 }}
-            />
-            <Line type="monotone" dataKey="engagement" stroke="#3d84a8" strokeWidth={2.5} dot={{ r: 4, fill: '#3d84a8' }} activeDot={{ r: 6 }} />
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
+      {data.timeline.length > 0 && (
+        <div style={{ padding: '16px', borderRadius: 16, background: dark ? '#162535' : '#ffffff', border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}` }}>
+          <p style={{ margin: '0 0 12px', fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.3 }}>
+            CLASS ENGAGEMENT OVER SESSION
+          </p>
+          <ResponsiveContainer width="100%" height={110}>
+            <LineChart data={data.timeline} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={dark ? '#2a4458' : '#e8f0f8'} />
+              <XAxis dataKey="t" tick={{ fontSize: 10, fill: dark ? '#7aa5c0' : '#6b8ba4', fontFamily: 'Manrope' }} />
+              <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: dark ? '#7aa5c0' : '#6b8ba4', fontFamily: 'Manrope' }} />
+              <Tooltip contentStyle={{ background: dark ? '#162535' : '#fff', border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`, borderRadius: 8, fontSize: 12, fontFamily: 'Manrope' }} />
+              <Line type="monotone" dataKey="engagement" stroke="#3d84a8" strokeWidth={2.5} dot={{ r: 4, fill: '#3d84a8' }} activeDot={{ r: 6 }} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
     </div>
   )
 }
