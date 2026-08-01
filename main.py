@@ -25,6 +25,7 @@ import os
 import uuid
 import numpy as np
 import cv2
+import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -159,6 +160,51 @@ def create_report():
         raise HTTPException(status_code=404, detail="No session data logged yet.")
     pdf_path, flags_csv_path, png_dir = result
     return {"pdf": os.path.basename(pdf_path), "flags_csv": os.path.basename(flags_csv_path)}
+
+
+@app.get("/api/reports/summary")
+def reports_summary():
+    """Real class + per-student engagement summary, computed from
+    cognitive_load_log.csv (written by mood_detection.py sessions).
+    IMPORTANT: declared BEFORE /api/reports/{filename} below -- FastAPI
+    matches routes in declaration order, and a wildcard path param route
+    declared first would otherwise swallow this literal path (treating
+    "summary" as a filename to look up)."""
+    if not os.path.isfile("cognitive_load_log.csv"):
+        return {"students": [], "avgEngagement": None, "topPerformer": None,
+                "needsCheckIn": 0, "timeline": []}
+
+    df = pd.read_csv("cognitive_load_log.csv")
+    if df.empty:
+        return {"students": [], "avgEngagement": None, "topPerformer": None,
+                "needsCheckIn": 0, "timeline": []}
+
+    df["Engagement"] = (100 - df["CognitiveLoad"]).clip(lower=0)
+
+    per_student = df.groupby("Name")["Engagement"].mean().round().astype(int)
+    students = []
+    for name, eng in per_student.items():
+        if name.startswith("Unknown"):
+            continue  # unrecognized faces shouldn't show as a "student"
+        students.append({"name": name, "engagementAvg": int(eng), "flag": bool(eng < 65)})
+    students.sort(key=lambda s: -s["engagementAvg"])
+
+    avg_engagement = int(df["Engagement"].mean())
+    top_performer = students[0]["name"] if students else None
+    needs_check_in = sum(1 for s in students if s["flag"])
+
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    df["Minute"] = df["Timestamp"].dt.strftime("%H:%M")
+    timeline_df = df.groupby("Minute")["Engagement"].mean().round().astype(int)
+    timeline = [{"t": t, "engagement": int(v)} for t, v in timeline_df.items()]
+
+    return {
+        "students": students,
+        "avgEngagement": avg_engagement,
+        "topPerformer": top_performer,
+        "needsCheckIn": needs_check_in,
+        "timeline": timeline,
+    }
 
 
 @app.get("/api/reports/{filename}")
