@@ -1383,14 +1383,24 @@ function ReportDetailScreen({ student, onBack, dark }: { student: typeof STUDENT
 }
 
 // ─── Screen: Students ─────────────────────────────────────────────────────────
-function StudentsScreen({ onStudent, dark }: { onStudent: (s: typeof STUDENTS[0]) => void; dark: boolean }) {
+function StudentsScreen({ onStudent, dark }: { onStudent: (s: any) => void; dark: boolean }) {
+  const [students, setStudents] = useState<{ name: string; engagementAvg: number; flag: boolean }[]>([])
+  const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
-  const filtered = STUDENTS.filter(s => s.name.toLowerCase().includes(query.toLowerCase()))
+
+  useEffect(() => {
+    apiGet('/api/reports/summary')
+      .then(data => setStudents(data.students || []))
+      .catch(() => setStudents([]))
+      .finally(() => setLoading(false))
+  }, [])
+
+  const filtered = students.filter(s => s.name.toLowerCase().includes(query.toLowerCase()))
+
   return (
     <div className="phone-scroll" style={{ flex: 1, padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 14 }}>
       <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Students</h2>
 
-      {/* Search */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 10,
         padding: '10px 14px', borderRadius: 12,
@@ -1408,45 +1418,59 @@ function StudentsScreen({ onStudent, dark }: { onStudent: (s: typeof STUDENTS[0]
         />
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        {filtered.map(student => (
-          <div key={student.id} onClick={() => onStudent(student)} style={{
-            padding: '12px 14px', borderRadius: 14, cursor: 'pointer',
-            background: dark ? '#162535' : '#ffffff',
-            border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
-            display: 'flex', alignItems: 'center', gap: 12,
-          }}>
-            <AvatarDot student={student} size={44} />
-            <div style={{ flex: 1 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 15, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c' }}>{student.name}</span>
-                {student.flag && icons.flag()}
+      {loading ? (
+        <p style={{ fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', textAlign: 'center', marginTop: 20 }}>Loading…</p>
+      ) : filtered.length === 0 ? (
+        <p style={{ fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', textAlign: 'center', marginTop: 20 }}>
+          No students with session data yet. Run a Mood Monitor session to populate this list.
+        </p>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {filtered.map(student => (
+            <div key={student.name} onClick={() => onStudent(student)} style={{
+              padding: '12px 14px', borderRadius: 14, cursor: 'pointer',
+              background: dark ? '#162535' : '#ffffff',
+              border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
+              display: 'flex', alignItems: 'center', gap: 12,
+            }}>
+              <div style={{
+                width: 44, height: 44, borderRadius: '50%',
+                background: dark ? '#1a3a32' : '#eef8f5',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 15, fontWeight: 700, color: '#3d84a8', flexShrink: 0,
+              }}>
+                {student.name.slice(0, 2).toUpperCase()}
               </div>
-              <div style={{ display: 'flex', gap: 8, marginTop: 4, alignItems: 'center' }}>
-                <span style={{ fontSize: 11, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>
-                  {student.attendancePct}% attendance
-                </span>
-                <span style={{ color: dark ? '#2a4458' : '#d4e4ef' }}>·</span>
-                <MoodPill label={student.moods[student.moods.length - 1]} />
+              <div style={{ flex: 1 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 15, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c' }}>{student.name}</span>
+                  {student.flag && icons.flag()}
+                </div>
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <div style={{ fontSize: 16, fontWeight: 800, color: student.engagementAvg >= 75 ? '#5bb8a0' : student.engagementAvg >= 60 ? '#3d84a8' : '#e8b86d' }}>
+                  {student.engagementAvg}%
+                </div>
+                <div style={{ fontSize: 10, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 600 }}>engagement</div>
               </div>
             </div>
-            <div style={{ textAlign: 'right' }}>
-              <div style={{ fontSize: 16, fontWeight: 800, color: student.engagementAvg >= 75 ? '#5bb8a0' : student.engagementAvg >= 60 ? '#3d84a8' : '#e8b86d' }}>
-                {student.engagementAvg}%
-              </div>
-              <div style={{ fontSize: 10, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 2 }}>
-                <TrendArrow trend={student.trend} /> engagement
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
-
 // ─── Screen: Student Detail ────────────────────────────────────────────────────
-function StudentDetailScreen({ student, onBack, dark }: { student: typeof STUDENTS[0]; onBack: () => void; dark: boolean }) {
+function StudentDetailScreen({ student, onBack, dark }: {
+  student: { name: string; engagementAvg: number; flag: boolean }
+  onBack: () => void
+  dark: boolean
+}) {
+  const initials = student.name.slice(0, 2).toUpperCase()
+  // Deterministic hue from the name so the same student always gets the same color,
+  // without needing a stored `hue` field from the backend.
+  const hue = student.name.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0) % 360
+
   return (
     <div className="phone-scroll" style={{ flex: 1, padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 14 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -1463,76 +1487,69 @@ function StudentDetailScreen({ student, onBack, dark }: { student: typeof STUDEN
         border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
         display: 'flex', alignItems: 'center', gap: 16,
       }}>
-        <AvatarDot student={student} size={60} />
+        <div style={{
+          width: 60, height: 60, borderRadius: '50%',
+          background: `hsl(${hue}, 55%, 75%)`,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 20, fontWeight: 700, color: `hsl(${hue}, 40%, 30%)`, flexShrink: 0,
+        }}>
+          {initials}
+        </div>
         <div>
           <div style={{ fontSize: 18, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>{student.name}</div>
-          <div style={{ fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500, marginBottom: 8 }}>Year 10 · Science Group A</div>
-          <div style={{ display: 'flex', gap: 6 }}>
-            {student.moods.slice(-3).map((m, i) => <MoodPill key={i} label={m} />)}
+          <div style={{ fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>
+            {student.flag ? 'Worth checking in on' : 'No concerns'}
           </div>
         </div>
       </div>
 
-      {/* Stats row */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-        {[
-          { label: 'Attendance', value: `${student.attendancePct}%`, color: student.attendancePct >= 90 ? '#5bb8a0' : '#e8b86d', sub: 'this term' },
-          { label: 'Avg Engagement', value: `${student.engagementAvg}%`, color: '#3d84a8', sub: 'last 5 sessions' },
-        ].map(({ label, value, color, sub }) => (
-          <div key={label} style={{
-            padding: '16px', borderRadius: 14,
-            background: dark ? '#162535' : '#ffffff',
-            border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
-            textAlign: 'center',
-          }}>
-            <div style={{ fontSize: 24, fontWeight: 800, color }}>{value}</div>
-            <div style={{ fontSize: 11, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c' }}>{label}</div>
-            <div style={{ fontSize: 10, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>{sub}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Attendance history */}
-      <div style={{ padding: '14px', borderRadius: 14, background: dark ? '#162535' : '#ffffff', border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}` }}>
-        <p style={{ margin: '0 0 12px', fontSize: 11, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.3 }}>ATTENDANCE HISTORY</p>
-        <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
-          {Array.from({ length: 20 }).map((_, i) => {
-            const present2 = Math.random() < student.attendancePct / 100
-            return (
-              <div key={i} style={{
-                width: 24, height: 24, borderRadius: 6,
-                background: present2 ? (dark ? '#1a3a32' : '#eef8f5') : (dark ? '#1a2e40' : '#f0f4f8'),
-                border: `1.5px solid ${present2 ? '#5bb8a0' : (dark ? '#2a4458' : '#d4e4ef')}`,
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                fontSize: 11,
-              }}>
-                {present2 ? '✓' : ''}
-              </div>
-            )
-          })}
+      {/* Engagement stat */}
+      <div style={{
+        padding: '20px', borderRadius: 16,
+        background: dark ? '#162535' : '#ffffff',
+        border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
+        textAlign: 'center',
+      }}>
+        <div style={{
+          fontSize: 32, fontWeight: 800,
+          color: student.engagementAvg >= 75 ? '#5bb8a0' : student.engagementAvg >= 60 ? '#3d84a8' : '#e8b86d',
+        }}>
+          {student.engagementAvg}%
         </div>
-        <div style={{ marginTop: 6, display: 'flex', gap: 10, fontSize: 10, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>
-          <span>✓ Present</span><span>□ Absent</span>
+        <div style={{ fontSize: 13, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c', marginTop: 4 }}>
+          Average Engagement
+        </div>
+        <div style={{ fontSize: 11, color: dark ? '#7aa5c0' : '#6b8ba4', marginTop: 2 }}>
+          across all logged sessions
         </div>
       </div>
 
-      {/* Registration photos */}
-      <div style={{ padding: '14px', borderRadius: 14, background: dark ? '#162535' : '#ffffff', border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}` }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-          <p style={{ margin: 0, fontSize: 11, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.3 }}>REGISTRATION PHOTOS</p>
-          <span style={{ fontSize: 11, color: '#3d84a8', fontWeight: 600 }}>15 angles</span>
+      {/* Flag banner */}
+      {student.flag && (
+        <div style={{
+          padding: '14px 16px', borderRadius: 14,
+          background: dark ? '#2a1f0a' : '#fef9ee',
+          border: '1.5px solid #e8b86d',
+          display: 'flex', gap: 10, alignItems: 'center',
+        }}>
+          <span style={{ fontSize: 20 }}>💛</span>
+          <p style={{ margin: 0, fontSize: 12, color: dark ? '#a0b880' : '#7a6830', fontWeight: 500, lineHeight: 1.5 }}>
+            This student's average engagement is below 65% — a brief check-in may help.
+          </p>
         </div>
-        <div style={{ display: 'flex', gap: 6, overflowX: 'auto' }}>
-          {Array.from({ length: 8 }).map((_, i) => (
-            <div key={i} style={{
-              width: 48, height: 60, borderRadius: 10, flexShrink: 0,
-              background: dark ? '#1a2e40' : '#e8f0f8',
-              border: `1.5px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 22,
-            }}>😊</div>
-          ))}
-        </div>
+      )}
+
+      {/* Note about what's coming */}
+      <div style={{
+        padding: '14px', borderRadius: 14,
+        background: dark ? '#162535' : '#ffffff',
+        border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
+      }}>
+        <p style={{ margin: 0, fontSize: 12, color: dark ? '#7aa5c0' : '#6b8ba4', lineHeight: 1.6 }}>
+          Attendance history, mood breakdown, and registration photos for individual
+          students will appear here in a future update, once the backend tracks
+          per-student attendance and mood data over time.
+        </p>
       </div>
     </div>
   )
