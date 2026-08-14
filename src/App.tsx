@@ -112,7 +112,14 @@ function AvatarDot({ student, size = 40 }: { student: typeof STUDENTS[0]; size?:
     </div>
   )
 }
-
+function StatusClock() {
+  const [time, setTime] = useState(new Date())
+  useEffect(() => {
+    const t = setInterval(() => setTime(new Date()), 1000)
+    return () => clearInterval(t)
+  }, [])
+  return <span>{time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+}
 function TrendArrow({ trend }: { trend: string }) {
   if (trend === 'up') return <span style={{ color: '#5bb8a0', fontSize: 13 }}>↑</span>
   if (trend === 'down') return <span style={{ color: '#e8b86d', fontSize: 13 }}>↓</span>
@@ -129,7 +136,14 @@ function MoodPill({ label }: { label: string }) {
     </span>
   )
 }
-
+function StatusClock() {
+  const [time, setTime] = useState(new Date())
+  useEffect(() => {
+    const t = setInterval(() => setTime(new Date()), 1000)
+    return () => clearInterval(t)
+  }, [])
+  return <span>{time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+}
 // ─── Icons ────────────────────────────────────────────────────────────────────
 const icons = {
   home: (c = 'currentColor') => <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><polyline points="9 22 9 12 15 12 15 22" /></svg>,
@@ -182,14 +196,7 @@ function PhoneFrame({ children, dark }: { children: React.ReactNode; dark: boole
           color: dark ? '#7aa5c0' : '#6b8ba4', fontSize: 12, fontWeight: 600,
           flexShrink: 0,
         }}>
-          function StatusClock() {
-            const [time, setTime] = useState(new Date())
-            useEffect(() => {
-              const t = setInterval(() => setTime(new Date()), 1000)
-              return () => clearInterval(t)
-            }, [])
-          return <span>{time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-          }
+          <StatusClock />
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
             <span style={{ fontSize: 10 }}>●●●</span>
             <span style={{ fontSize: 10 }}>▲</span>
