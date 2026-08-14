@@ -34,7 +34,7 @@ RUN pip install --no-cache-dir dlib-bin==19.24.6
 # build the real dlib from source and fail (no compiler installed here).
 RUN pip install --no-cache-dir --no-deps face_recognition==1.3.0
 
-RUN pip install --no-cache-dir git+https://github.com/ageitgey/face_recognition_models
+RUN pip install --no-cache-dir face_recognition_models==0.3.0
 RUN pip install --no-cache-dir protobuf==4.25.3 mediapipe==0.10.14
 RUN pip install --no-cache-dir onnxruntime==1.19.2
 
