@@ -95,7 +95,7 @@ class ExtendedMoodClassroomMonitor:
 
     def __init__(self, attendance_system,
                  log_file="cognitive_load_log.csv",
-                 detector_frame_interval=8,
+                 detector_frame_interval=16,
                  smoothing_alpha=0.78,
                  confirmation_required=4,
                  top_score_threshold=28.0,
@@ -619,6 +619,9 @@ class ExtendedMoodClassroomMonitor:
                 "mood": mood_label, "mood_confidence": round(float(mood_conf), 1),
                 "cognitive_load": round(float(smoothed_load), 1),
                 "perclos": round(float(perclos), 3),
+                # include per-emotion probabilities so the frontend can render the full
+                # FERPlus-derived distribution (keys match self.emotion_keys)
+                "emotion_probs": {k: round(float(smoothed.get(k, 0.0)), 1) for k in self.emotion_keys} if smoothed else {},
             })
 
             if frame_counter % self.detector_frame_interval == 0:

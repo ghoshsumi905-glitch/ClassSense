@@ -26,6 +26,7 @@ import uuid
 import numpy as np
 import cv2
 import pandas as pd
+import asyncio
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -138,7 +139,11 @@ async def mood_frame(session_id: str = Form(...), image: UploadFile = File(...))
         raise HTTPException(status_code=404, detail="Unknown session_id. Call /api/mood/start first.")
     frame = _read_upload_as_bgr(await image.read())
     state = mood_sessions[session_id]
-    results = state["monitor"].process_frame(frame, state["frame_counter"], session_id=session_id)
+    # Offload heavy synchronous processing (face mesh, ONNX inference) to a threadpool
+    loop = asyncio.get_running_loop()
+    # process_frame signature: (frame, frame_counter, session_id=None, run_emotion_model=True)
+    results = await loop.run_in_executor(None, state["monitor"].process_frame,
+                                         frame, state["frame_counter"], session_id)
     state["frame_counter"] += 1
     return {"faces": results}
 
