@@ -13,3 +13,5 @@ matplotlib==3.9.2
 onnxruntime==1.19.2
 protobuf==4.25.3
 setuptools<81
+SQLAlchemy==1.4.49
+psycopg2-binary==2.9.7
