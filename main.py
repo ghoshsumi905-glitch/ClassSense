@@ -64,17 +64,63 @@ app.add_middleware(
 attendance_system = AttendanceSystem(dataset_dir="registered_faces", attendance_file="attendance.csv")
 
 # Initialize DB (SQLAlchemy). Use DB_URL env var for Postgres in production; fallback to sqlite file.
-from db import engine, SessionLocal
-from models import Base, EmotionEvent, Flag
-# create tables if they don't exist
-Base.metadata.create_all(bind=engine)
-# create a session factory
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# Attempt to use SQLAlchemy if available; otherwise create sqlite3 fallback tables and helpers.
+from db import SQLALCHEMY_AVAILABLE
+if SQLALCHEMY_AVAILABLE:
+    from db import engine, SessionLocal
+    from models import Base, EmotionEvent, Flag
+    # create tables if they don't exist
+    Base.metadata.create_all(bind=engine)
+    # session factory
+    def get_db():
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+else:
+    # sqlite3 fallback (no SQLAlchemy installed)
+    MOOD_DB_PATH = os.environ.get("MOOD_DB_PATH") or "mood_events.db"
+    _sqlite_conn = sqlite3.connect(MOOD_DB_PATH, check_same_thread=False)
+    _sqlite_cur = _sqlite_conn.cursor()
+    _sqlite_cur.execute("""
+    CREATE TABLE IF NOT EXISTS emotion_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT,
+        recognized_name TEXT,
+        session_id TEXT,
+        ts TEXT NOT NULL,
+        emotion_probs TEXT NOT NULL,
+        source TEXT,
+        meta TEXT
+    )
+    """)
+    _sqlite_cur.execute("""
+    CREATE TABLE IF NOT EXISTS flags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT,
+        recognized_name TEXT,
+        ts TEXT NOT NULL,
+        reason TEXT,
+        metrics TEXT,
+        severity TEXT,
+        status TEXT DEFAULT 'open',
+        reviewed_by TEXT,
+        reviewed_at TEXT,
+        meta TEXT
+    )
+    """)
+    _sqlite_conn.commit()
+
+    def _sqlite_insert_event(user_id, name, session_id, ts, ep_json, source, meta_json):
+        try:
+            _sqlite_cur.execute(
+                "INSERT INTO emotion_events (user_id, recognized_name, session_id, ts, emotion_probs, source, meta) VALUES (?,?,?,?,?,?,?)",
+                (user_id, name, session_id, ts, ep_json, source, meta_json)
+            )
+            _sqlite_conn.commit()
+        except Exception:
+            _sqlite_conn.rollback()
 
 # Create a bounded ThreadPoolExecutor for mood inference tasks
 import concurrent.futures
@@ -307,26 +353,37 @@ async def mood_frame(session_id: str = Form(...), image: UploadFile = File(...))
     try:
         # use a short-running background future to avoid blocking response
         def _log_faces(faces, session_id):
-            db = SessionLocal()
             try:
-                for f in faces:
-                    ep = f.get("emotion_probs") or {}
-                    if not ep:
-                        continue
-                    ev = EmotionEvent(
-                        user_id=None,
-                        recognized_name=f.get("name"),
-                        session_id=session_id,
-                        emotion_probs=json.dumps(ep),
-                        source='mood_frame',
-                        meta=json.dumps({"box": f.get("box")})
-                    )
-                    db.add(ev)
-                db.commit()
+                if SQLALCHEMY_AVAILABLE:
+                    db = SessionLocal()
+                    try:
+                        for f in faces:
+                            ep = f.get("emotion_probs") or {}
+                            if not ep:
+                                continue
+                            ev = EmotionEvent(
+                                user_id=None,
+                                recognized_name=f.get("name"),
+                                session_id=session_id,
+                                emotion_probs=json.dumps(ep),
+                                source='mood_frame',
+                                meta=json.dumps({"box": f.get("box")})
+                            )
+                            db.add(ev)
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                    finally:
+                        db.close()
+                else:
+                    # sqlite fallback insert
+                    for f in faces:
+                        ep = f.get("emotion_probs") or {}
+                        if not ep:
+                            continue
+                        _sqlite_insert_event(None, f.get("name"), session_id, datetime.utcnow().isoformat(), json.dumps(ep), 'mood_frame', json.dumps({"box": f.get("box")}))
             except Exception:
-                db.rollback()
-            finally:
-                db.close()
+                pass
         _executor.submit(_log_faces, results, session_id)
     except Exception:
         pass
