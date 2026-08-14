@@ -111,14 +111,11 @@ class AttendanceSystem:
         print(f"Loaded {len(self.known_face_encodings)} face sample(s) for "
               f"{len(set(self.known_face_names))} student(s) (from DB).")
 
-    def register_face_images(self, name, image_bgr_list):
-        """Saves registration photos and stores corresponding face encodings.
+    def register_face_images(self, name, image_bgr_list, max_images=20):
+        """Saves registration photos (up to `max_images`) and stores corresponding face encodings.
 
-        Behavior:
-        - Always writes JPEGs to dataset_dir (for compatibility).
-        - If FACE_DB_PATH is configured, encodings are written to the SQLite
-          DB so they survive process restarts (when a persistent volume or
-          mounted path is used for that DB file).
+        - Limits captured images to max_images (default 20) to improve robustness.
+        - Writes JPEGs to dataset_dir and computes encodings; stores encodings in DB if configured.
         """
         import pickle
 
@@ -133,7 +130,7 @@ class AttendanceSystem:
 
         saved = 0
         encodings_to_save = []
-        for i, frame in enumerate(image_bgr_list):
+        for i, frame in enumerate(image_bgr_list[:max_images]):
             path = os.path.join(person_folder, f"{name.lower()}_{i}.jpg")
             cv2.imwrite(path, frame)
             saved += 1
@@ -165,27 +162,40 @@ class AttendanceSystem:
 
         return saved
 
-    def recognize_face(self, frame):
+    def recognize_faces(self, frame):
+        """Return a list of recognized names found in the frame. Uses two-pass
+        matching: primary tolerance and an optional relaxed tolerance to try and
+        capture partial/blurred faces. Returns list of names (lowercased) or "Unknown-<i>" placeholders.
+        """
+        results = []
         if len(self.known_face_encodings) == 0:
-            return "Unknown"
+            return []
 
         small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
 
         locations = face_recognition.face_locations(rgb)
         if len(locations) == 0:
-            return "Unknown"
+            return []
 
         encodings = face_recognition.face_encodings(rgb, locations)
-
-        for enc in encodings:
+        for i, enc in enumerate(encodings):
+            if len(self.known_face_encodings) == 0:
+                results.append(f"Unknown-{i}")
+                continue
             dists = face_recognition.face_distance(self.known_face_encodings, enc)
-            best_idx = np.argmin(dists)
-            best_dist = dists[best_idx]
+            best_idx = int(np.argmin(dists))
+            best_dist = float(dists[best_idx]) if len(dists) > 0 else 1.0
             if best_dist <= self.tolerance:
-                return self.known_face_names[best_idx]
-
-        return "Unknown"
+                results.append(self.known_face_names[best_idx])
+            else:
+                # relaxed second pass to handle partial/blur faces
+                rel_tol = min(0.9, self.tolerance * 1.25)
+                if best_dist <= rel_tol:
+                    results.append(self.known_face_names[best_idx])
+                else:
+                    results.append(f"Unknown-{i}")
+        return results
 
     def _append_attendance_row(self, name, status, session_id=None):
         now = datetime.now()
@@ -200,16 +210,18 @@ class AttendanceSystem:
         pd.DataFrame([row]).to_csv(self.attendance_file, mode="a", header=not file_exists, index=False)
 
     def process_attendance_frame(self, frame, marked_students, session_id=None):
-        """One frame in, one result out. Called per frame the browser sends
-        during an active attendance session. `marked_students` is the
-        session's running set (kept by the caller across calls)."""
-        name = self.recognize_face(frame)
-        newly_marked = False
-        if name != "Unknown" and name not in marked_students:
-            self._append_attendance_row(name, "Present", session_id)
-            marked_students.add(name)
-            newly_marked = True
-        return {"name": name, "newly_marked": newly_marked, "present_count": len(marked_students)}
+        """Process a frame containing potentially multiple faces.
+        Marks all recognized faces as Present (if not yet marked). Returns
+        a dict with list of names seen, newly marked count, and present_count.
+        """
+        names = self.recognize_faces(frame)
+        newly = []
+        for name in names:
+            if name and not name.startswith("Unknown") and name not in marked_students:
+                self._append_attendance_row(name, "Present", session_id)
+                marked_students.add(name)
+                newly.append(name)
+        return {"names": names, "newly_marked": newly, "present_count": len(marked_students)}
 
     def finalize_session(self, marked_students, session_id=None):
         all_registered = set(self.known_face_names)

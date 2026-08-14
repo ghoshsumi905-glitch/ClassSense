@@ -36,6 +36,17 @@ from attendance_system import AttendanceSystem
 from mood_detection import ExtendedMoodClassroomMonitor
 from session_report import generate_report
 
+# DB and monitoring helpers
+import sqlite3
+import json
+import io
+import base64
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+from monitor_flags import evaluate_user_events
+
 app = FastAPI(title="ClassSense API")
 
 # Allow your Vercel frontend (and localhost during dev) to call this API.
@@ -49,7 +60,26 @@ app.add_middleware(
 )
 
 # --- shared, process-wide state -------------------------------------------
+# Initialize attendance system (it supports optional FACE_DB_PATH env var)
 attendance_system = AttendanceSystem(dataset_dir="registered_faces", attendance_file="attendance.csv")
+
+# Initialize DB (SQLAlchemy). Use DB_URL env var for Postgres in production; fallback to sqlite file.
+from db import engine, SessionLocal
+from models import Base, EmotionEvent, Flag
+# create tables if they don't exist
+Base.metadata.create_all(bind=engine)
+# create a session factory
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Create a bounded ThreadPoolExecutor for mood inference tasks
+import concurrent.futures
+MAX_WORKERS = int(os.environ.get("MOOD_WORKERS", max(2, (os.cpu_count() or 2)//2)))
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # In-memory session registries. Fine for a single-instance deployment;
 # if you ever scale to multiple server instances, move this to Redis.
@@ -133,18 +163,174 @@ def start_mood_session():
     return {"session_id": session_id}
 
 
+# ----------------- New endpoints: log, summary, flags ---------------------
+@app.post("/api/mood/log")
+async def log_mood_event(payload: dict):
+    """Record a per-face emotion event for long-term aggregation and flagging.
+    Expects JSON: {user_id(optional), name(optional), session_id, ts(optional ISO), emotion_probs: {k: pct}}
+    """
+    required = ["emotion_probs"]
+    if not all(k in payload for k in required):
+        raise HTTPException(status_code=400, detail="Missing emotion_probs in payload")
+    ts = payload.get("ts") or datetime.utcnow().isoformat()
+    emotion_probs = payload["emotion_probs"]
+    try:
+        ep_json = json.dumps(emotion_probs)
+    except Exception:
+        raise HTTPException(status_code=400, detail="emotion_probs must be JSON-serializable")
+    cur = _conn.cursor()
+    cur.execute(
+        "INSERT INTO emotion_events (user_id, recognized_name, session_id, ts, emotion_probs, source, meta) VALUES (?,?,?,?,?,?,?)",
+        (
+            payload.get("user_id"), payload.get("name"), payload.get("session_id"), ts, ep_json, payload.get("source"), json.dumps(payload.get("meta") or {})
+        )
+    )
+    _conn.commit()
+    return {"status": "ok", "ts": ts}
+
+
+@app.get("/api/mood/summary")
+async def mood_summary(user_id: str = None, name: str = None, from_date: str = None, to_date: str = None):
+    """Return aggregated emotion distribution and a pie-chart (base64 PNG) for a user or name in a date range.
+    Dates are ISO-style (YYYY-MM-DD). If none provided, last 7 days are used.
+    """
+    cur = _conn.cursor()
+    params = []
+    clauses = []
+    if user_id:
+        clauses.append("user_id = ?")
+        params.append(user_id)
+    if name:
+        clauses.append("recognized_name = ?")
+        params.append(name)
+    if from_date:
+        clauses.append("ts >= ?")
+        params.append(from_date)
+    if to_date:
+        clauses.append("ts <= ?")
+        params.append(to_date)
+    if not clauses:
+        # default last 7 days
+        to_dt = datetime.utcnow()
+        fr_dt = to_dt - timedelta(days=7)
+        clauses.append("ts >= ?")
+        params.append(fr_dt.isoformat())
+    where = " AND ".join(clauses)
+    q = f"SELECT ts, emotion_probs FROM emotion_events WHERE {where} ORDER BY ts ASC"
+    cur.execute(q, params)
+    rows = cur.fetchall()
+    events = []
+    overall = defaultdict(float)
+    total = 0
+    for ts, ep_json in rows:
+        try:
+            ep = json.loads(ep_json)
+        except Exception:
+            continue
+        events.append({"ts": ts, "emotion_probs": ep})
+        for k, v in ep.items():
+            overall[k] += float(v)
+        total += 1
+    # normalize overall
+    if total > 0:
+        overall_pct = {k: round(v / total, 2) if isinstance(v, (int, float)) else 0.0 for k, v in overall.items()}
+    else:
+        overall_pct = {}
+
+    # evaluate flags
+    eval_res = evaluate_user_events(events)
+
+    # generate pie chart PNG base64
+    png_b64 = None
+    try:
+        labels = list(overall_pct.keys())
+        vals = [overall_pct.get(k, 0.0) for k in labels]
+        fig, ax = plt.subplots(figsize=(6, 4))
+        if sum(vals) > 0:
+            ax.pie(vals, labels=labels, autopct="%1.1f%%")
+        else:
+            ax.text(0.5, 0.5, "No data", horizontalalignment='center')
+        ax.set_title('Emotion distribution')
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        png_b64 = base64.b64encode(buf.read()).decode('ascii')
+    except Exception as e:
+        png_b64 = None
+
+    return {"total_samples": total, "distribution": overall_pct, "flag_evaluation": eval_res, "pie_chart_base64": png_b64}
+
+
+@app.get("/api/mood/flags")
+async def mood_flags(since_days: int = 7, sadness_threshold: float = 0.55, required_days: int = 4, instability_threshold: float = 0.05):
+    """Scan all users and return flags where heuristic criteria met. This is a simple scan suitable for small deployments.
+    In production run this as a background job and store flags in flags table.
+    """
+    cur = _conn.cursor()
+    # gather all events in window
+    cutoff = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
+    cur.execute("SELECT user_id, recognized_name, ts, emotion_probs FROM emotion_events WHERE ts >= ?", (cutoff,))
+    rows = cur.fetchall()
+    users = defaultdict(list)
+    for user_id, name, ts, ep_json in rows:
+        try:
+            ep = json.loads(ep_json)
+        except Exception:
+            continue
+        key = user_id or name or "unknown"
+        users[key].append({"ts": ts, "emotion_probs": ep})
+    results = []
+    from monitor_flags import evaluate_user_events as _eval
+    for key, evs in users.items():
+        res = _eval(evs, since_days=since_days, sadness_threshold=sadness_threshold, required_days=required_days, instability_threshold=instability_threshold)
+        if res.get("flag"):
+            results.append({"user": key, "evaluation": res})
+            # insert flag row for record
+            cur.execute("INSERT INTO flags (user_id, recognized_name, ts, reason, metrics, severity, status) VALUES (?,?,?,?,?,?,?)",
+                        (None, key if key != 'unknown' else None, datetime.utcnow().isoformat(), res.get("reason"), json.dumps(res.get("metrics")), 'medium', 'open'))
+    _conn.commit()
+    return {"flags": results}
+
+
 @app.post("/api/mood/frame")
 async def mood_frame(session_id: str = Form(...), image: UploadFile = File(...)):
     if session_id not in mood_sessions:
         raise HTTPException(status_code=404, detail="Unknown session_id. Call /api/mood/start first.")
     frame = _read_upload_as_bgr(await image.read())
     state = mood_sessions[session_id]
-    # Offload heavy synchronous processing (face mesh, ONNX inference) to a threadpool
     loop = asyncio.get_running_loop()
-    # process_frame signature: (frame, frame_counter, session_id=None, run_emotion_model=True)
-    results = await loop.run_in_executor(None, state["monitor"].process_frame,
-                                         frame, state["frame_counter"], session_id)
+    # Offload heavy synchronous processing to bounded executor
+    results = await loop.run_in_executor(_executor, state["monitor"].process_frame, frame, state["frame_counter"], session_id)
     state["frame_counter"] += 1
+    # Auto-log each face result to DB for long-term analysis (non-blocking write)
+    try:
+        # use a short-running background future to avoid blocking response
+        def _log_faces(faces, session_id):
+            db = SessionLocal()
+            try:
+                for f in faces:
+                    ep = f.get("emotion_probs") or {}
+                    if not ep:
+                        continue
+                    ev = EmotionEvent(
+                        user_id=None,
+                        recognized_name=f.get("name"),
+                        session_id=session_id,
+                        emotion_probs=json.dumps(ep),
+                        source='mood_frame',
+                        meta=json.dumps({"box": f.get("box")})
+                    )
+                    db.add(ev)
+                db.commit()
+            except Exception:
+                db.rollback()
+            finally:
+                db.close()
+        _executor.submit(_log_faces, results, session_id)
+    except Exception:
+        pass
+
     return {"faces": results}
 
 
