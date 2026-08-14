@@ -20,8 +20,6 @@ in production.
 import os
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
-# ... your existing imports (FastAPI, mood_detection, etc.) go below this
-import os
 import uuid
 import numpy as np
 import cv2
@@ -41,6 +39,7 @@ import sqlite3
 import json
 import io
 import base64
+from collections import defaultdict
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -53,25 +52,25 @@ app = FastAPI(title="ClassSense API")
 # Replace "*" with your actual Vercel URL before going to production.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict to ["https://class-sense-prototype.vercel.app"]
+    allow_origins=["*"],  # TODO: restrict to ["https://class-sense-prototype-classsense.vercel.app"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # --- shared, process-wide state -------------------------------------------
-# Initialize attendance system (it supports optional FACE_DB_PATH env var)
+# AttendanceSystem now reads DB_URL from the environment itself (Postgres
+# via Neon/Supabase in production), falling back to local filesystem if
+# DB_URL isn't set. See attendance_system.py.
 attendance_system = AttendanceSystem(dataset_dir="registered_faces", attendance_file="attendance.csv")
 
 # Initialize DB (SQLAlchemy). Use DB_URL env var for Postgres in production; fallback to sqlite file.
-# Attempt to use SQLAlchemy if available; otherwise create sqlite3 fallback tables and helpers.
 from db import SQLALCHEMY_AVAILABLE
 if SQLALCHEMY_AVAILABLE:
     from db import engine, SessionLocal
     from models import Base, EmotionEvent, Flag
-    # create tables if they don't exist
     Base.metadata.create_all(bind=engine)
-    # session factory
+
     def get_db():
         db = SessionLocal()
         try:
@@ -79,7 +78,7 @@ if SQLALCHEMY_AVAILABLE:
         finally:
             db.close()
 else:
-    # sqlite3 fallback (no SQLAlchemy installed)
+    # sqlite3 fallback (no SQLAlchemy installed, or no DB_URL set)
     MOOD_DB_PATH = os.environ.get("MOOD_DB_PATH") or "mood_events.db"
     _sqlite_conn = sqlite3.connect(MOOD_DB_PATH, check_same_thread=False)
     _sqlite_cur = _sqlite_conn.cursor()
@@ -121,6 +120,35 @@ else:
             _sqlite_conn.commit()
         except Exception:
             _sqlite_conn.rollback()
+
+    def _sqlite_fetch_events(user_id=None, name=None, from_date=None, to_date=None):
+        clauses, params = [], []
+        if user_id:
+            clauses.append("user_id = ?"); params.append(user_id)
+        if name:
+            clauses.append("recognized_name = ?"); params.append(name)
+        if from_date:
+            clauses.append("ts >= ?"); params.append(from_date)
+        if to_date:
+            clauses.append("ts <= ?"); params.append(to_date)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        q = f"SELECT ts, emotion_probs FROM emotion_events{where} ORDER BY ts ASC"
+        _sqlite_cur.execute(q, params)
+        return _sqlite_cur.fetchall()
+
+    def _sqlite_fetch_all_since(cutoff_iso):
+        _sqlite_cur.execute(
+            "SELECT user_id, recognized_name, ts, emotion_probs FROM emotion_events WHERE ts >= ?",
+            (cutoff_iso,)
+        )
+        return _sqlite_cur.fetchall()
+
+    def _sqlite_insert_flag(user_id, name, ts, reason, metrics_json, severity, status):
+        _sqlite_cur.execute(
+            "INSERT INTO flags (user_id, recognized_name, ts, reason, metrics, severity, status) VALUES (?,?,?,?,?,?,?)",
+            (user_id, name, ts, reason, metrics_json, severity, status)
+        )
+        _sqlite_conn.commit()
 
 # Create a bounded ThreadPoolExecutor for mood inference tasks
 import concurrent.futures
@@ -186,7 +214,13 @@ async def attendance_frame(session_id: str = Form(...), image: UploadFile = File
         raise HTTPException(status_code=404, detail="Unknown session_id. Call /api/attendance/start first.")
     frame = _read_upload_as_bgr(await image.read())
     session = attendance_sessions[session_id]
-    result = attendance_system.process_attendance_frame(frame, session["marked"], session_id)
+    loop = asyncio.get_running_loop()
+    # Offloaded to the thread pool -- face_recognition is CPU-heavy and
+    # blocking; running it inline on the event loop freezes every other
+    # request on the server while it runs.
+    result = await loop.run_in_executor(
+        _executor, attendance_system.process_attendance_frame, frame, session["marked"], session_id
+    )
     return result
 
 
@@ -210,6 +244,7 @@ def start_mood_session():
 
 
 # ----------------- New endpoints: log, summary, flags ---------------------
+
 @app.post("/api/mood/log")
 async def log_mood_event(payload: dict):
     """Record a per-face emotion event for long-term aggregation and flagging.
@@ -224,14 +259,28 @@ async def log_mood_event(payload: dict):
         ep_json = json.dumps(emotion_probs)
     except Exception:
         raise HTTPException(status_code=400, detail="emotion_probs must be JSON-serializable")
-    cur = _conn.cursor()
-    cur.execute(
-        "INSERT INTO emotion_events (user_id, recognized_name, session_id, ts, emotion_probs, source, meta) VALUES (?,?,?,?,?,?,?)",
-        (
-            payload.get("user_id"), payload.get("name"), payload.get("session_id"), ts, ep_json, payload.get("source"), json.dumps(payload.get("meta") or {})
+
+    if SQLALCHEMY_AVAILABLE:
+        db = SessionLocal()
+        try:
+            ev = EmotionEvent(
+                user_id=payload.get("user_id"),
+                recognized_name=payload.get("name"),
+                session_id=payload.get("session_id"),
+                emotion_probs=ep_json,
+                source=payload.get("source"),
+                meta=json.dumps(payload.get("meta") or {}),
+            )
+            db.add(ev)
+            db.commit()
+        finally:
+            db.close()
+    else:
+        _sqlite_insert_event(
+            payload.get("user_id"), payload.get("name"), payload.get("session_id"),
+            ts, ep_json, payload.get("source"), json.dumps(payload.get("meta") or {})
         )
-    )
-    _conn.commit()
+
     return {"status": "ok", "ts": ts}
 
 
@@ -240,31 +289,30 @@ async def mood_summary(user_id: str = None, name: str = None, from_date: str = N
     """Return aggregated emotion distribution and a pie-chart (base64 PNG) for a user or name in a date range.
     Dates are ISO-style (YYYY-MM-DD). If none provided, last 7 days are used.
     """
-    cur = _conn.cursor()
-    params = []
-    clauses = []
-    if user_id:
-        clauses.append("user_id = ?")
-        params.append(user_id)
-    if name:
-        clauses.append("recognized_name = ?")
-        params.append(name)
-    if from_date:
-        clauses.append("ts >= ?")
-        params.append(from_date)
-    if to_date:
-        clauses.append("ts <= ?")
-        params.append(to_date)
-    if not clauses:
-        # default last 7 days
+    if not from_date and not to_date and not user_id and not name:
         to_dt = datetime.utcnow()
         fr_dt = to_dt - timedelta(days=7)
-        clauses.append("ts >= ?")
-        params.append(fr_dt.isoformat())
-    where = " AND ".join(clauses)
-    q = f"SELECT ts, emotion_probs FROM emotion_events WHERE {where} ORDER BY ts ASC"
-    cur.execute(q, params)
-    rows = cur.fetchall()
+        from_date = fr_dt.isoformat()
+
+    rows = []
+    if SQLALCHEMY_AVAILABLE:
+        db = SessionLocal()
+        try:
+            q = db.query(EmotionEvent.ts, EmotionEvent.emotion_probs)
+            if user_id:
+                q = q.filter(EmotionEvent.user_id == user_id)
+            if name:
+                q = q.filter(EmotionEvent.recognized_name == name)
+            if from_date:
+                q = q.filter(EmotionEvent.ts >= from_date)
+            if to_date:
+                q = q.filter(EmotionEvent.ts <= to_date)
+            rows = q.order_by(EmotionEvent.ts.asc()).all()
+        finally:
+            db.close()
+    else:
+        rows = _sqlite_fetch_events(user_id=user_id, name=name, from_date=from_date, to_date=to_date)
+
     events = []
     overall = defaultdict(float)
     total = 0
@@ -273,20 +321,15 @@ async def mood_summary(user_id: str = None, name: str = None, from_date: str = N
             ep = json.loads(ep_json)
         except Exception:
             continue
-        events.append({"ts": ts, "emotion_probs": ep})
+        events.append({"ts": str(ts), "emotion_probs": ep})
         for k, v in ep.items():
             overall[k] += float(v)
         total += 1
-    # normalize overall
-    if total > 0:
-        overall_pct = {k: round(v / total, 2) if isinstance(v, (int, float)) else 0.0 for k, v in overall.items()}
-    else:
-        overall_pct = {}
 
-    # evaluate flags
+    overall_pct = {k: round(v / total, 2) for k, v in overall.items()} if total > 0 else {}
+
     eval_res = evaluate_user_events(events)
 
-    # generate pie chart PNG base64
     png_b64 = None
     try:
         labels = list(overall_pct.keys())
@@ -302,7 +345,7 @@ async def mood_summary(user_id: str = None, name: str = None, from_date: str = N
         plt.close(fig)
         buf.seek(0)
         png_b64 = base64.b64encode(buf.read()).decode('ascii')
-    except Exception as e:
+    except Exception:
         png_b64 = None
 
     return {"total_samples": total, "distribution": overall_pct, "flag_evaluation": eval_res, "pie_chart_base64": png_b64}
@@ -313,11 +356,20 @@ async def mood_flags(since_days: int = 7, sadness_threshold: float = 0.55, requi
     """Scan all users and return flags where heuristic criteria met. This is a simple scan suitable for small deployments.
     In production run this as a background job and store flags in flags table.
     """
-    cur = _conn.cursor()
-    # gather all events in window
     cutoff = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
-    cur.execute("SELECT user_id, recognized_name, ts, emotion_probs FROM emotion_events WHERE ts >= ?", (cutoff,))
-    rows = cur.fetchall()
+
+    rows = []
+    if SQLALCHEMY_AVAILABLE:
+        db = SessionLocal()
+        try:
+            rows = db.query(
+                EmotionEvent.user_id, EmotionEvent.recognized_name, EmotionEvent.ts, EmotionEvent.emotion_probs
+            ).filter(EmotionEvent.ts >= cutoff).all()
+        finally:
+            db.close()
+    else:
+        rows = _sqlite_fetch_all_since(cutoff)
+
     users = defaultdict(list)
     for user_id, name, ts, ep_json in rows:
         try:
@@ -325,17 +377,34 @@ async def mood_flags(since_days: int = 7, sadness_threshold: float = 0.55, requi
         except Exception:
             continue
         key = user_id or name or "unknown"
-        users[key].append({"ts": ts, "emotion_probs": ep})
+        users[key].append({"ts": str(ts), "emotion_probs": ep})
+
     results = []
-    from monitor_flags import evaluate_user_events as _eval
     for key, evs in users.items():
-        res = _eval(evs, since_days=since_days, sadness_threshold=sadness_threshold, required_days=required_days, instability_threshold=instability_threshold)
+        res = evaluate_user_events(
+            evs, since_days=since_days, sadness_threshold=sadness_threshold,
+            required_days=required_days, instability_threshold=instability_threshold
+        )
         if res.get("flag"):
             results.append({"user": key, "evaluation": res})
-            # insert flag row for record
-            cur.execute("INSERT INTO flags (user_id, recognized_name, ts, reason, metrics, severity, status) VALUES (?,?,?,?,?,?,?)",
-                        (None, key if key != 'unknown' else None, datetime.utcnow().isoformat(), res.get("reason"), json.dumps(res.get("metrics")), 'medium', 'open'))
-    _conn.commit()
+            now_iso = datetime.utcnow().isoformat()
+            reason = res.get("reason")
+            metrics_json = json.dumps(res.get("metrics"))
+            user_key = None if key == 'unknown' else key
+            if SQLALCHEMY_AVAILABLE:
+                db = SessionLocal()
+                try:
+                    flag = Flag(
+                        user_id=None, recognized_name=user_key, ts=now_iso,
+                        reason=reason, metrics=metrics_json, severity='medium', status='open'
+                    )
+                    db.add(flag)
+                    db.commit()
+                finally:
+                    db.close()
+            else:
+                _sqlite_insert_flag(None, user_key, now_iso, reason, metrics_json, 'medium', 'open')
+
     return {"flags": results}
 
 
@@ -346,12 +415,10 @@ async def mood_frame(session_id: str = Form(...), image: UploadFile = File(...))
     frame = _read_upload_as_bgr(await image.read())
     state = mood_sessions[session_id]
     loop = asyncio.get_running_loop()
-    # Offload heavy synchronous processing to bounded executor
     results = await loop.run_in_executor(_executor, state["monitor"].process_frame, frame, state["frame_counter"], session_id)
     state["frame_counter"] += 1
-    # Auto-log each face result to DB for long-term analysis (non-blocking write)
+
     try:
-        # use a short-running background future to avoid blocking response
         def _log_faces(faces, session_id):
             try:
                 if SQLALCHEMY_AVAILABLE:
@@ -376,7 +443,6 @@ async def mood_frame(session_id: str = Form(...), image: UploadFile = File(...))
                     finally:
                         db.close()
                 else:
-                    # sqlite fallback insert
                     for f in faces:
                         ep = f.get("emotion_probs") or {}
                         if not ep:
@@ -433,7 +499,7 @@ def reports_summary():
     students = []
     for name, eng in per_student.items():
         if name.startswith("Unknown"):
-            continue  # unrecognized faces shouldn't show as a "student"
+            continue
         students.append({"name": name, "engagementAvg": int(eng), "flag": bool(eng < 65)})
     students.sort(key=lambda s: -s["engagementAvg"])
 

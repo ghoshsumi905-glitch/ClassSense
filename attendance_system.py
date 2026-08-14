@@ -14,10 +14,21 @@ sessions from the desktop version become explicit start_session /
 process_frame / end_session calls, with session state (which students have
 been marked present) kept per-session_id in memory (see SessionManager
 in main.py).
+
+PERSISTENCE UPDATE:
+Render's free tier has no persistent disk, so any encodings written to a
+local file (including a local sqlite DB) are wiped on every redeploy. Face
+encodings are now stored in the same Postgres database as everything else
+(via DB_URL, e.g. a free Neon/Supabase instance) using SQLAlchemy Core --
+this survives redeploys, unlike local disk.
+
+If DB_URL isn't set (e.g. running locally without a database), this falls
+back to the original filesystem-based "registered_faces" folder behavior,
+so local development still works without any external dependency.
 """
 
 import os
-import time
+import pickle
 import numpy as np
 import pandas as pd
 import cv2
@@ -26,45 +37,56 @@ from datetime import datetime
 
 
 class AttendanceSystem:
-    def __init__(self, dataset_dir="registered_faces", attendance_file="attendance.csv", tolerance=0.50, face_db_path=None):
-        """If FACE_DB_PATH (or face_db_path) is provided, face encodings are persisted
-        into a SQLite database there. If not provided, the original filesystem-based
+    def __init__(self, dataset_dir="registered_faces", attendance_file="attendance.csv",
+                 tolerance=0.50, face_db_url=None):
+        """If DB_URL (env var) or face_db_url is provided, face encodings are persisted
+        into that database via SQLAlchemy (works with Postgres, e.g. Neon/Supabase, or
+        sqlite for local dev). If not provided, the original filesystem-based
         "registered_faces" folder behavior is preserved.
         """
-        import sqlite3
-        import pickle
-
         self.dataset_dir = dataset_dir
         self.attendance_file = attendance_file
         self.tolerance = tolerance
         self.known_face_encodings = []
         self.known_face_names = []
 
-        # Optional persistent DB for face encodings. Controlled by env var FACE_DB_PATH
-        self.face_db_path = os.environ.get("FACE_DB_PATH") or face_db_path
-        self.use_db = bool(self.face_db_path)
+        db_url = os.environ.get("DB_URL") or face_db_url
+        self.use_db = bool(db_url)
+        self._engine = None
+
         if self.use_db:
-            # initialize DB connection and table
-            self._db_conn = sqlite3.connect(self.face_db_path, check_same_thread=False)
-            cur = self._db_conn.cursor()
-            cur.execute("""CREATE TABLE IF NOT EXISTS faces (
-                            name TEXT,
-                            encoding BLOB
-                          )""")
-            self._db_conn.commit()
-            # load encodings from DB
+            from sqlalchemy import create_engine, text
+            self._text = text
+            self._engine = create_engine(db_url, pool_pre_ping=True)
+            self._is_postgres = db_url.startswith("postgres")
+
+            blob_type = "BYTEA" if self._is_postgres else "BLOB"
+            with self._engine.begin() as conn:
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS faces (
+                        id SERIAL PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        encoding {blob_type} NOT NULL
+                    )
+                """ if self._is_postgres else f"""
+                    CREATE TABLE IF NOT EXISTS faces (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        encoding {blob_type} NOT NULL
+                    )
+                """))
             self._load_encodings_from_db()
         else:
             # fallback to filesystem-based load (original behavior)
             self.load_registered_faces(self.dataset_dir)
 
+    # ---------- loading known faces ----------
+
     def load_registered_faces(self, folder_path):
-        """Filesystem loading path preserved for backward compatibility. If
-        FACE_DB_PATH is enabled the DB-backed loader is used instead and this
-        method is not required for startup loading.
-        """
+        """Filesystem loading path preserved for backward compatibility / local dev.
+        If DB_URL is set, the DB-backed loader is used instead and this method
+        is not required for startup loading."""
         if self.use_db:
-            # DB-backed load handled in __init__ via _load_encodings_from_db
             return
 
         self.known_face_encodings = []
@@ -93,32 +115,35 @@ class AttendanceSystem:
               f"{len(set(self.known_face_names))} student(s).")
 
     def _load_encodings_from_db(self):
-        """Load pickled numpy encodings from the faces table."""
-        import pickle
-        cur = self._db_conn.cursor()
-        cur.execute("SELECT name, encoding FROM faces")
-        rows = cur.fetchall()
+        """Load pickled numpy encodings from the faces table via SQLAlchemy."""
         self.known_face_encodings = []
         self.known_face_names = []
-        for name, blob in rows:
-            try:
-                enc = pickle.loads(blob)
-                self.known_face_encodings.append(enc)
-                self.known_face_names.append(name)
-            except Exception as e:
-                print(f"Failed to deserialize encoding for {name}: {e}")
+        try:
+            with self._engine.begin() as conn:
+                rows = conn.execute(self._text("SELECT name, encoding FROM faces")).fetchall()
+            for name, blob in rows:
+                try:
+                    # psycopg2 may return memoryview for BYTEA; normalize to bytes
+                    raw = bytes(blob) if not isinstance(blob, (bytes, bytearray)) else blob
+                    enc = pickle.loads(raw)
+                    self.known_face_encodings.append(enc)
+                    self.known_face_names.append(name)
+                except Exception as e:
+                    print(f"Failed to deserialize encoding for {name}: {e}")
+        except Exception as e:
+            print(f"Failed to load encodings from DB: {e}")
 
         print(f"Loaded {len(self.known_face_encodings)} face sample(s) for "
               f"{len(set(self.known_face_names))} student(s) (from DB).")
 
+    # ---------- registration ----------
+
     def register_face_images(self, name, image_bgr_list, max_images=20):
-        """Saves registration photos (up to `max_images`) and stores corresponding face encodings.
-
-        - Limits captured images to max_images (default 20) to improve robustness.
-        - Writes JPEGs to dataset_dir and computes encodings; stores encodings in DB if configured.
+        """Saves registration photos (up to `max_images`) and stores corresponding face
+        encodings. Photos still go to local disk (ephemeral on Render free tier -- fine,
+        since only the encodings need to persist). Encodings go to the DB if configured,
+        which is what survives redeploys.
         """
-        import pickle
-
         person_folder = os.path.join(self.dataset_dir, name.lower())
         os.makedirs(person_folder, exist_ok=True)
         # clear old images (keeps dataset_dir tidy)
@@ -134,7 +159,6 @@ class AttendanceSystem:
             path = os.path.join(person_folder, f"{name.lower()}_{i}.jpg")
             cv2.imwrite(path, frame)
             saved += 1
-            # compute encoding from saved file (face_recognition expects RGB-loaded image)
             try:
                 img = face_recognition.load_image_file(path)
                 encs = face_recognition.face_encodings(img)
@@ -143,24 +167,29 @@ class AttendanceSystem:
             except Exception as e:
                 print(f"Warning: failed to compute encoding for {path}: {e}")
 
-        # Persist encodings to DB if enabled. Replace any existing encodings for this name.
         if self.use_db and encodings_to_save:
-            cur = self._db_conn.cursor()
-            cur.execute("DELETE FROM faces WHERE name = ?", (name.lower(),))
-            for enc in encodings_to_save:
-                try:
-                    blob = pickle.dumps(enc)
-                    cur.execute("INSERT INTO faces (name, encoding) VALUES (?, ?)", (name.lower(), blob))
-                except Exception as e:
-                    print(f"Warning: could not save encoding to DB for {name}: {e}")
-            self._db_conn.commit()
-            # reload in-memory arrays from DB
-            self._load_encodings_from_db()
-        else:
-            # fallback: reload from filesystem (original behavior)
+            try:
+                with self._engine.begin() as conn:
+                    conn.execute(
+                        self._text("DELETE FROM faces WHERE name = :name"),
+                        {"name": name.lower()}
+                    )
+                    for enc in encodings_to_save:
+                        blob = pickle.dumps(enc)
+                        conn.execute(
+                            self._text("INSERT INTO faces (name, encoding) VALUES (:name, :encoding)"),
+                            {"name": name.lower(), "encoding": blob}
+                        )
+                self._load_encodings_from_db()
+            except Exception as e:
+                print(f"Warning: could not save encodings to DB for {name}: {e}")
+        elif not self.use_db:
+            # fallback: reload from filesystem (original behavior, no DB configured)
             self.load_registered_faces(self.dataset_dir)
 
         return saved
+
+    # ---------- recognition ----------
 
     def recognize_faces(self, frame):
         """Return a list of recognized names found in the frame. Uses two-pass
@@ -189,13 +218,14 @@ class AttendanceSystem:
             if best_dist <= self.tolerance:
                 results.append(self.known_face_names[best_idx])
             else:
-                # relaxed second pass to handle partial/blur faces
                 rel_tol = min(0.9, self.tolerance * 1.25)
                 if best_dist <= rel_tol:
                     results.append(self.known_face_names[best_idx])
                 else:
                     results.append(f"Unknown-{i}")
         return results
+
+    # ---------- attendance logging ----------
 
     def _append_attendance_row(self, name, status, session_id=None):
         now = datetime.now()
@@ -212,8 +242,7 @@ class AttendanceSystem:
     def process_attendance_frame(self, frame, marked_students, session_id=None):
         """Process a frame containing potentially multiple faces.
         Marks all recognized faces as Present (if not yet marked). Returns
-        a dict with list of names seen, newly marked count, and present_count.
-        """
+        a dict with list of names seen, newly marked count, and present_count."""
         names = self.recognize_faces(frame)
         newly = []
         for name in names:
