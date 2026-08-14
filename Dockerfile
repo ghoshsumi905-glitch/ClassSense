@@ -38,6 +38,13 @@ RUN pip install --no-cache-dir face_recognition_models==0.3.0
 RUN pip install --no-cache-dir protobuf==4.25.3 mediapipe==0.10.14
 RUN pip install --no-cache-dir onnxruntime==1.19.2
 
+# Database layer (SQLAlchemy + Postgres driver) -- required for
+# attendance_system.py's face-encoding persistence and db.py's
+# emotion_events/flags tables. Was previously missing from this
+# Dockerfile even though requirements.txt listed it, since this file
+# never actually runs `pip install -r requirements.txt`.
+RUN pip install --no-cache-dir SQLAlchemy==1.4.49 psycopg2-binary==2.9.7
+
 COPY . .
 # models/emotion-ferplus-8.onnx gets copied here along with everything else
 
