@@ -73,9 +73,9 @@ def evaluate_user_events(events, since_days=7, sadness_threshold=0.55, required_
 
     reason = []
     if weekly_flag:
-        reason.append(f"persistence_of_sadness: {sad_days} days >= {required_days}")
+        reason.append(f"sustained_low_mood: {sad_days} days >= {required_days} — suggest teacher check-in")
     if instability_flag:
-        reason.append(f"instability_avg: {instability:.3f} >= {instability_threshold}")
+        reason.append(f"mood_volatility: {instability:.3f} >= {instability_threshold} — suggest teacher check-in")
 
     return {"flag": flag, "reason": "; ".join(reason) if reason else "none", "metrics": {"sad_days": sad_days, "instability": instability, "day_metrics": {str(k): v for k, v in day_metrics.items()}}}
 

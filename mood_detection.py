@@ -113,7 +113,9 @@ class ExtendedMoodClassroomMonitor:
                  gaze_offset_threshold=0.20,
                  load_weight_attentiveness=0.6,
                  load_weight_mood=0.4,
-                 face_detection_confidence=0.35):
+                 face_detection_confidence=0.35,
+                 phone_pitch_threshold_deg=22.0, 
+                 phone_use_duration_seconds=120):
 
         self.attendance = attendance_system
         self.log_file = log_file
@@ -186,6 +188,9 @@ class ExtendedMoodClassroomMonitor:
         self._RIGHT_IRIS = [469, 470, 471, 472]
         self._LEFT_EYE_H = (263, 362)
         self._RIGHT_EYE_H = (33, 133)
+        self.phone_pitch_threshold_deg = phone_pitch_threshold_deg
+        self.phone_use_duration_seconds = phone_use_duration_seconds
+        self.person_down_since = {}
 
     # ---------- face detection ----------
 
@@ -256,6 +261,20 @@ class ExtendedMoodClassroomMonitor:
             return direction, confidence, yaw, pitch
         except Exception:
             return "UNKNOWN", 0.0, 0.0, 0.0
+    def _track_phone_use(self, name, pitch, direction_confidence):
+        now = time.time()
+        trustworthy = direction_confidence >= self.head_pose_confidence_floor
+        looking_down = trustworthy and pitch is not None and pitch > self.phone_pitch_threshold_deg
+
+        if looking_down:
+            if self.person_down_since.get(name) is None:
+                self.person_down_since[name] = now
+            elapsed = now - self.person_down_since[name]
+        else:
+            self.person_down_since[name] = None
+            elapsed = 0.0
+
+        return elapsed >= self.phone_use_duration_seconds, round(elapsed, 1)
 
     def _gaze_offset(self, landmarks):
         try:
@@ -397,7 +416,16 @@ class ExtendedMoodClassroomMonitor:
         due_for_recheck = track["resolved"] and (track["frames_seen"] % self.reverify_interval == 0)
 
         if not track["resolved"] or due_for_recheck:
-            recognized = self.attendance.recognize_face(face_crop)
+            try:
+                # Backward-compatible path: prefer single-face API if present.
+                if hasattr(self.attendance, "recognize_face"):
+                    recognized = self.attendance.recognize_face(face_crop)
+                else:
+                    # Newer AttendanceSystem exposes recognize_faces().
+                    names = self.attendance.recognize_faces(face_crop)
+                    recognized = names[0] if names else None
+            except Exception:
+                recognized = None
             if recognized and recognized != "Unknown":
                 track["name"] = recognized
                 track["resolved"] = True
@@ -413,9 +441,6 @@ class ExtendedMoodClassroomMonitor:
             if not (50 <= total <= 150):
                 return None
             return result
-        except Exception:
-            self._emotion_fail_count += 1
-            return None
         except Exception:
             self._emotion_fail_count += 1
             return None
@@ -587,6 +612,7 @@ class ExtendedMoodClassroomMonitor:
             landmarks = self._extract_landmarks_for_crop(face_crop)
 
             head_direction, direction_confidence, yaw, pitch = self._head_pose(landmarks, face_crop.shape)
+            phone_alert, seconds_looking_down = self._track_phone_use(name, pitch, direction_confidence)
             gaze_offset = self._gaze_offset(landmarks)
             ear = self._calculate_eye_aspect_ratio(landmarks)
             mar = self._calculate_mouth_aspect_ratio(landmarks)
@@ -622,6 +648,8 @@ class ExtendedMoodClassroomMonitor:
                 # include per-emotion probabilities so the frontend can render the full
                 # FERPlus-derived distribution (keys match self.emotion_keys)
                 "emotion_probs": {k: round(float(smoothed.get(k, 0.0)), 1) for k in self.emotion_keys} if smoothed else {},
+                "phone_alert": phone_alert,
+                "seconds_looking_down": seconds_looking_down,
             })
 
             if frame_counter % self.detector_frame_interval == 0:
