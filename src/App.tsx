@@ -182,7 +182,14 @@ function PhoneFrame({ children, dark }: { children: React.ReactNode; dark: boole
           color: dark ? '#7aa5c0' : '#6b8ba4', fontSize: 12, fontWeight: 600,
           flexShrink: 0,
         }}>
-          <span>9:41</span>
+          function StatusClock() {
+            const [time, setTime] = useState(new Date())
+            useEffect(() => {
+              const t = setInterval(() => setTime(new Date()), 1000)
+              return () => clearInterval(t)
+            }, [])
+          return <span>{time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+          }
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
             <span style={{ fontSize: 10 }}>●●●</span>
             <span style={{ fontSize: 10 }}>▲</span>
