@@ -493,7 +493,7 @@ function RegistrationScreen({ onBack, dark }: { onBack: () => void; dark: boolea
   const [capturedBlobs, setCapturedBlobs] = useState<Blob[]>([])
   const [step, setStep] = useState<'name' | 'capture' | 'review' | 'saving' | 'done'>('name')
   const [error, setError] = useState<string | null>(null)
-  const total = 8 // fewer than the original 15 — plenty for good recognition, faster to test
+  const total =15// increased from 8 to 20 to improve registration robustness (more angle samples)
 
   useEffect(() => {
     if (step !== 'capture') return
@@ -959,13 +959,15 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
           {faces.map((f, i) => {
             const { x, y, w, h } = f.box
             const barW = w
+            const phoneAlert = Boolean(f?.phone_alert)
+            const boxColor = phoneAlert ? '#e04545' : attentionColor(f.attentiveness)
             return (
               <g key={i}>
                 <rect x={x} y={y} width={w} height={h} rx="8" fill="none"
-                  stroke={attentionColor(f.attentiveness)} strokeWidth="2" opacity="0.85" />
+                  stroke={boxColor} strokeWidth="2" opacity="0.85" />
                 <rect x={x} y={y - 34} width={barW} height={12} rx="6" fill="rgba(0,0,0,0.45)" />
                 <rect x={x} y={y - 34} width={barW * (f.attentiveness_confidence / 100)} height={12} rx="6"
-                  fill={attentionColor(f.attentiveness)} opacity="0.9" />
+                  fill={boxColor} opacity="0.9" />
                 <text x={x + 6} y={y - 25} fontSize="10" fill="white" fontFamily="Manrope" fontWeight="700">
                   {f.attentiveness}
                 </text>
@@ -977,7 +979,7 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
                 </text>
                 <rect x={x} y={y + h} width={barW} height={18} fill="rgba(0,0,0,0.4)" />
                 <text x={x + 5} y={y + h + 13} fontSize="10" fill="white" fontFamily="Manrope" fontWeight="700">
-                  {f.name} · load {Math.round(f.cognitive_load)}
+                  {f.name} · load {Math.round(f.cognitive_load)}{phoneAlert ? ' · phone' : ''}
                 </text>
               </g>
             )
