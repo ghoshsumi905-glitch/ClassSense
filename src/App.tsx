@@ -112,14 +112,6 @@ function AvatarDot({ student, size = 40 }: { student: typeof STUDENTS[0]; size?:
     </div>
   )
 }
-function StatusClock() {
-  const [time, setTime] = useState(new Date())
-  useEffect(() => {
-    const t = setInterval(() => setTime(new Date()), 1000)
-    return () => clearInterval(t)
-  }, [])
-  return <span>{time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-}
 function TrendArrow({ trend }: { trend: string }) {
   if (trend === 'up') return <span style={{ color: '#5bb8a0', fontSize: 13 }}>↑</span>
   if (trend === 'down') return <span style={{ color: '#e8b86d', fontSize: 13 }}>↓</span>
