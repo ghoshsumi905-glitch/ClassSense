@@ -64,6 +64,26 @@ these numbers.
 One monitor INSTANCE = one live session, so per-student calibration and
 identity tracking correctly persist across frames within that session
 (exactly like the desktop version persisted across loop iterations).
+
+CHANGELOG (this revision):
+  - Unknown-face bucketing: unresolved faces are still tracked
+    internally by a per-track identity key (so two different
+    unrecognized students in the same session don't get their
+    calibration/state mixed together), but the NAME WRITTEN TO THE
+    LOG AND RETURNED TO THE FRONTEND is now a single flat "Unknown"
+    instead of "Unknown-0", "Unknown-3", etc. Previously every
+    unresolved track minted its own permanent pseudo-student, which
+    polluted per-name grouping in session_report.py and the reports
+    endpoints in main.py.
+  - Live engagement timeline + insight: the monitor now accumulates
+    per-minute engagement (100 - cognitive_load) for identified
+    students while a session is live, and exposes get_live_insight()
+    -- a chart-ready timeline plus a short rule-based narrative for
+    the in-progress session, in the same spirit as the AI Weekly
+    Report's narrative in main.py (states only numbers actually
+    computed from this session, never a diagnostic label). Wire this
+    up to a new `/api/mood/insight?session_id=...` endpoint in
+    main.py that calls `mood_sessions[session_id]["monitor"].get_live_insight()`.
 """
 
 import time
@@ -191,6 +211,13 @@ class ExtendedMoodClassroomMonitor:
         self.phone_pitch_threshold_deg = phone_pitch_threshold_deg
         self.phone_use_duration_seconds = phone_use_duration_seconds
         self.person_down_since = {}
+
+        # ---- live engagement timeline / insight state (one instance = one live session) ----
+        self.session_start_time = time.time()
+        # "HH:MM" -> list of instantaneous engagement values (100 - cognitive_load),
+        # identified students only (Unknown faces excluded, same rule the reports
+        # endpoints in main.py use for the weekly/summary aggregates).
+        self._minute_engagement = defaultdict(list)
 
     # ---------- face detection ----------
 
@@ -411,6 +438,17 @@ class ExtendedMoodClassroomMonitor:
         return list(zip(assignments, boxes))
 
     def _resolve_identity(self, track_id, face_crop):
+        """Returns the INTERNAL identity key for this track -- either the
+        recognized student's name, or a per-track placeholder like
+        "Unknown-3". This key is deliberately kept unique per track (not
+        collapsed to a single "Unknown") because it's used everywhere below
+        to key calibration buffers and attentiveness/mood state machines --
+        collapsing it here would mix two different unrecognized students'
+        baselines and hysteresis state together.
+
+        Anything that goes to the FRONTEND or the CSV LOG should instead use
+        `_display_name()` below, which buckets every unresolved track down
+        to a flat "Unknown" so reports don't get one row-group per track."""
         track = self.tracks[track_id]
         track["frames_seen"] += 1
         due_for_recheck = track["resolved"] and (track["frames_seen"] % self.reverify_interval == 0)
@@ -433,6 +471,13 @@ class ExtendedMoodClassroomMonitor:
                 track["name"] = f"Unknown-{track_id}"
 
         return track["name"]
+
+    @staticmethod
+    def _display_name(internal_name):
+        """Bucket any per-track "Unknown-N" placeholder down to a flat
+        "Unknown" for anything user-facing (frontend overlay, CSV log,
+        downstream reports). Recognized names pass through unchanged."""
+        return "Unknown" if str(internal_name).startswith("Unknown") else internal_name
 
     def _analyze_emotions_for_face(self, face_bgr):
         try:
@@ -588,6 +633,79 @@ class ExtendedMoodClassroomMonitor:
         w = self.person_load_window[name]
         return sum(w) / len(w) if w else 0.0
 
+    def _record_live_engagement(self, display_name, engagement):
+        """Feeds the current-session per-minute engagement accumulator used
+        by get_live_insight(). Unknown faces are excluded -- same rule the
+        reports endpoints in main.py already apply -- since an unresolved
+        track isn't a real student the class-level insight should be about."""
+        if display_name == "Unknown":
+            return
+        minute_key = time.strftime("%H:%M")
+        self._minute_engagement[minute_key].append(max(0.0, min(100.0, engagement)))
+
+    def get_live_insight(self):
+        """Live Engagement Timeline + Insight for the CURRENT, in-progress
+        session. This instance is scoped to exactly one live session (see
+        mood_sessions in main.py), so everything here is naturally
+        session-local -- no SessionId filtering needed the way the
+        historical CSV-based reports require it.
+
+        Returns a chart-ready per-minute timeline plus a short rule-based
+        narrative. Mirrors the reasoning behind _weekly_trend_narrative in
+        main.py: only ever states numbers actually computed this session,
+        so it can't hallucinate a trend that isn't there, and it never
+        applies a diagnostic label to a student -- at most "worth a
+        check-in."
+
+        Not yet wired to an endpoint -- add something like:
+
+            @app.get("/api/mood/insight")
+            def mood_insight(session_id: str):
+                if session_id not in mood_sessions:
+                    raise HTTPException(status_code=404, detail="Unknown session_id.")
+                return mood_sessions[session_id]["monitor"].get_live_insight()
+
+        to main.py to expose this to the frontend.
+        """
+        if not self._minute_engagement:
+            return {"available": False}
+
+        timeline = [
+            {"t": minute, "engagement": round(statistics.mean(vals))}
+            for minute, vals in sorted(self._minute_engagement.items())
+        ]
+        all_values = [v for vals in self._minute_engagement.values() for v in vals]
+        avg_engagement = round(statistics.mean(all_values)) if all_values else 0
+        elapsed_minutes = round((time.time() - self.session_start_time) / 60, 1)
+
+        narrative_parts = [
+            f"The class has averaged {avg_engagement}% engagement over the "
+            f"{elapsed_minutes} minute(s) logged so far this session."
+        ]
+
+        if len(timeline) >= 4:
+            half = len(timeline) // 2
+            first_half_avg = statistics.mean(t["engagement"] for t in timeline[:half])
+            second_half_avg = statistics.mean(t["engagement"] for t in timeline[half:])
+            delta = second_half_avg - first_half_avg
+            if delta <= -8:
+                narrative_parts.append("Engagement has dropped noticeably as the session has gone on.")
+            elif delta >= 8:
+                narrative_parts.append("Engagement has picked up as the session has gone on.")
+            else:
+                narrative_parts.append("Engagement has stayed fairly steady through the session.")
+
+        if avg_engagement < 65:
+            narrative_parts.append("Worth a quick check-in with the room.")
+
+        return {
+            "available": True,
+            "elapsedMinutes": elapsed_minutes,
+            "avgEngagement": avg_engagement,
+            "timeline": timeline,
+            "narrative": " ".join(narrative_parts),
+        }
+
     # ---------- THE NEW PUBLIC ENTRY POINT: one frame in, JSON out ----------
 
     def process_frame(self, frame, frame_counter, session_id=None, run_emotion_model=True):
@@ -608,7 +726,11 @@ class ExtendedMoodClassroomMonitor:
             if face_crop.size == 0:
                 continue
 
+            # `name` is the internal identity key (e.g. "Unknown-3") used for
+            # per-track calibration/state below. `display_name` is what
+            # actually reaches the frontend and the CSV log.
             name = self._resolve_identity(track_id, face_crop)
+            display_name = self._display_name(name)
             landmarks = self._extract_landmarks_for_crop(face_crop)
 
             head_direction, direction_confidence, yaw, pitch = self._head_pose(landmarks, face_crop.shape)
@@ -638,8 +760,13 @@ class ExtendedMoodClassroomMonitor:
             instant_load = self._cognitive_load(att_label, mood_label, perclos, entropy_val)
             smoothed_load = self._update_load_window(name, instant_load)
 
+            # Live Engagement Timeline + Insight: feed this frame's engagement
+            # (inverse of cognitive load, same convention main.py's reports
+            # use) into the current session's per-minute accumulator.
+            self._record_live_engagement(display_name, 100.0 - smoothed_load)
+
             results.append({
-                "name": name,
+                "name": display_name,
                 "box": {"x": int(x1), "y": int(y1), "w": int(x2 - x1), "h": int(y2 - y1)},
                 "attentiveness": att_label, "attentiveness_confidence": round(float(att_conf), 1),
                 "mood": mood_label, "mood_confidence": round(float(mood_conf), 1),
@@ -654,7 +781,7 @@ class ExtendedMoodClassroomMonitor:
 
             if frame_counter % self.detector_frame_interval == 0:
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                log_rows.append([name, att_label, f"{att_conf:.1f}", mood_label, f"{mood_conf:.1f}",
+                log_rows.append([display_name, att_label, f"{att_conf:.1f}", mood_label, f"{mood_conf:.1f}",
                                   f"{smoothed_load:.2f}", f"{perclos:.2f}", timestamp, session_id or ""])
 
         if log_rows:

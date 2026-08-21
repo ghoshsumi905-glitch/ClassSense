@@ -521,6 +521,154 @@ def reports_summary():
     }
 
 
+def _weekly_trend_narrative(daily_engagement, avg_engagement, prev_avg_engagement,
+                             flagged_count, most_improved, most_declined, num_students):
+    """Rule-based natural-language summary of the week's engagement data --
+    the 'AI' in 'AI Weekly Report'. Deliberately template-driven rather than
+    a model call: it only ever states numbers that were actually computed
+    from cognitive_load_log.csv, so it can't hallucinate a trend that isn't
+    there. See the same reasoning in session_report.py's flagging language."""
+    lines = []
+
+    num_days = len(daily_engagement)
+    day_word = "day" if num_days == 1 else "days"
+
+    if prev_avg_engagement is None:
+        lines.append(
+            f"This is the first full reporting period with enough data — the class averaged "
+            f"{avg_engagement}% engagement across {num_days} logged {day_word} and {num_students} student(s)."
+        )
+    else:
+        delta = avg_engagement - prev_avg_engagement
+        if delta >= 3:
+            lines.append(
+                f"Engagement is trending up this week, averaging {avg_engagement}% "
+                f"(up {delta:.0f} point{'s' if abs(delta) != 1 else ''} from the prior period)."
+            )
+        elif delta <= -3:
+            lines.append(
+                f"Engagement dipped this week, averaging {avg_engagement}% "
+                f"(down {abs(delta):.0f} point{'s' if abs(delta) != 1 else ''} from the prior period)."
+            )
+        else:
+            lines.append(f"Engagement held steady this week, averaging {avg_engagement}% across the class.")
+
+    if most_improved:
+        lines.append(
+            f"{most_improved['name']} showed the biggest improvement, "
+            f"up {most_improved['delta']:.0f} points versus last period."
+        )
+    if most_declined:
+        lines.append(
+            f"{most_declined['name']} saw the largest drop, "
+            f"down {abs(most_declined['delta']):.0f} points — worth a check-in."
+        )
+
+    if flagged_count > 0:
+        lines.append(
+            f"{flagged_count} student{'s' if flagged_count != 1 else ''} "
+            f"{'are' if flagged_count != 1 else 'is'} currently averaging below 65% engagement "
+            f"and may benefit from follow-up."
+        )
+    else:
+        lines.append("No students are currently flagged for low engagement — nice week.")
+
+    return " ".join(lines)
+
+
+@app.get("/api/reports/weekly")
+def weekly_report(days: int = 7):
+    """AI Weekly Report Generator.
+
+    Aggregates cognitive_load_log.csv over the trailing `days` window
+    (default 7) and compares it against the preceding window of equal
+    length, producing:
+      - a per-day engagement series (for the chart)
+      - per-student weekly averages, with the existing <65% flag rule
+      - the single most-improved and most-declined student week-over-week
+      - a short rule-based narrative summary (see _weekly_trend_narrative)
+
+    Declared as a literal path before /api/reports/{filename} for the same
+    routing reason documented on /api/reports/summary above."""
+    if not os.path.isfile("cognitive_load_log.csv"):
+        return {"available": False}
+
+    df = pd.read_csv("cognitive_load_log.csv")
+    if df.empty:
+        return {"available": False}
+
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+    df = df.dropna(subset=["Timestamp"])
+    if df.empty:
+        return {"available": False}
+
+    df["Engagement"] = (100 - df["CognitiveLoad"]).clip(lower=0)
+    df = df[~df["Name"].astype(str).str.startswith("Unknown")]
+    if df.empty:
+        return {"available": False}
+
+    now = df["Timestamp"].max()
+    period_start = now - pd.Timedelta(days=days)
+    prev_start = period_start - pd.Timedelta(days=days)
+
+    current = df[(df["Timestamp"] > period_start) & (df["Timestamp"] <= now)].copy()
+    previous = df[(df["Timestamp"] > prev_start) & (df["Timestamp"] <= period_start)]
+
+    if current.empty:
+        return {"available": False}
+
+    # Per-day engagement, for the bar chart
+    current["Date"] = current["Timestamp"].dt.strftime("%Y-%m-%d")
+    daily = current.groupby("Date")["Engagement"].mean().round().astype(int)
+    daily_engagement = [{"date": d, "avgEngagement": int(v)} for d, v in daily.items()]
+
+    # Per-student current-window averages (same <65% flag rule as /summary)
+    per_student_current = current.groupby("Name")["Engagement"].mean()
+    students = []
+    for name, eng in per_student_current.items():
+        students.append({"name": name, "engagementAvg": int(round(eng)), "flag": bool(eng < 65)})
+    students.sort(key=lambda s: -s["engagementAvg"])
+    flagged_count = sum(1 for s in students if s["flag"])
+
+    avg_engagement = int(round(current["Engagement"].mean()))
+
+    prev_avg_engagement = None
+    most_improved = None
+    most_declined = None
+    if not previous.empty:
+        prev_avg_engagement = int(round(previous["Engagement"].mean()))
+        per_student_prev = previous.groupby("Name")["Engagement"].mean()
+        deltas = []
+        for name, cur_eng in per_student_current.items():
+            if name in per_student_prev.index:
+                deltas.append({"name": name, "delta": float(cur_eng) - float(per_student_prev[name])})
+        if deltas:
+            deltas.sort(key=lambda d: d["delta"], reverse=True)
+            if deltas[0]["delta"] > 0.5:
+                most_improved = deltas[0]
+            if deltas[-1]["delta"] < -0.5:
+                most_declined = deltas[-1]
+
+    narrative = _weekly_trend_narrative(
+        daily_engagement, avg_engagement, prev_avg_engagement,
+        flagged_count, most_improved, most_declined, len(students)
+    )
+
+    return {
+        "available": True,
+        "periodStart": period_start.isoformat(),
+        "periodEnd": now.isoformat(),
+        "avgEngagement": avg_engagement,
+        "prevAvgEngagement": prev_avg_engagement,
+        "dailyEngagement": daily_engagement,
+        "students": students,
+        "flaggedCount": flagged_count,
+        "mostImproved": most_improved,
+        "mostDeclined": most_declined,
+        "narrative": narrative,
+    }
+
+
 @app.get("/api/reports/{filename}")
 def download_report(filename: str):
     path = os.path.join("session_reports", filename)
