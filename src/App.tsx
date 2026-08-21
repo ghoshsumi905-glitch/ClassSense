@@ -15,6 +15,7 @@ type Screen =
   | 'mood'
   | 'reports'
   | 'report-detail'
+  | 'weekly-report'
   | 'students'
   | 'student-detail'
   | 'settings'
@@ -159,6 +160,9 @@ const icons = {
   trash: (c = 'currentColor') => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4h6v2" /></svg>,
   lock: (c = 'currentColor') => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg>,
   book: (c = 'currentColor') => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" /></svg>,
+  sparkle: (c = 'currentColor') => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3l1.9 5.3L19 10l-5.1 1.7L12 17l-1.9-5.3L5 10l5.1-1.7L12 3z" /><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z" /></svg>,
+  trendUp: (c = 'currentColor') => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18" /><polyline points="17 6 23 6 23 12" /></svg>,
+  trendDown: (c = 'currentColor') => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 18 13.5 8.5 8.5 13.5 1 6" /><polyline points="17 18 23 18 23 12" /></svg>,
 }
 
 // ─── Layout Shell ─────────────────────────────────────────────────────────────
@@ -808,6 +812,23 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
   )
 }
 
+// ─── Live insight helper (Mood Monitor) ───────────────────────────────────────
+// Rule-based, not model-based, same "state only what's actually in the data"
+// philosophy as the AI Weekly Report narrative on the backend.
+type LiveInsight = { text: string; tone: 'good' | 'warn' | 'neutral' }
+
+function computeLiveInsight(points: { t: string; engagement: number }[]): LiveInsight | null {
+  if (points.length < 4) return null
+  const recent = points.slice(-3)
+  const prior = points.slice(-6, -3)
+  if (prior.length === 0) return null
+  const avg = (arr: typeof points) => arr.reduce((a, b) => a + b.engagement, 0) / arr.length
+  const delta = avg(recent) - avg(prior)
+  if (delta <= -8) return { text: 'Engagement dipping over the last few minutes — might be a good moment for a quick break or change of pace.', tone: 'warn' }
+  if (delta >= 8) return { text: 'Engagement climbing — the class is settling into focus.', tone: 'good' }
+  return { text: 'Engagement holding steady this session.', tone: 'neutral' }
+}
+
 // ─── Screen: Mood Monitor ─────────────────────────────────────────────────────
 function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -823,6 +844,13 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
   const moodCounts = useRef<Record<string, number>>({})
   const loadSamples = useRef<number[]>([])
   const [, forceUpdate] = useState(0) // re-render when refs change
+
+  // Live Engagement Timeline + Insight: a short rolling buffer that gets
+  // flushed into a labeled point every 5s, independent of frame cadence,
+  // so the sparkline reads smoothly regardless of network jitter.
+  const windowBufferRef = useRef<number[]>([])
+  const timelineRef = useRef<{ t: string; engagement: number }[]>([])
+  const sessionStartRef = useRef<number | null>(null)
 
   const CALIBRATION_SECONDS = 25
 
@@ -844,6 +872,7 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
       }
       const data = await apiPost('/api/mood/start', new FormData())
       setSessionId(data.session_id)
+      sessionStartRef.current = Date.now()
     }
     init()
     return () => { stream?.getTracks().forEach(t => t.stop()) }
@@ -886,12 +915,44 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
             moodCounts.current[f.mood] = (moodCounts.current[f.mood] || 0) + 1
             loadSamples.current.push(f.cognitive_load)
             if (loadSamples.current.length > 200) loadSamples.current.shift()
+
+            // Live Engagement Timeline: exclude unresolved "Unknown" faces so
+            // an unrecognized person in frame can't skew the class engagement
+            // number. Matches the exclusion mood_detection.py's
+            // _record_live_engagement() already applies server-side, and the
+            // same rule main.py's /api/reports/summary and /api/reports/weekly
+            // use for historical aggregates.
+            if (f.name !== 'Unknown') {
+              windowBufferRef.current.push(f.cognitive_load)
+            }
           }
           forceUpdate(n => n + 1)
         } catch { /* skip failed frame */ }
       }, 'image/jpeg', 0.8)
     }, 700)
     return () => clearInterval(interval)
+  }, [sessionId])
+
+  // 4. Live Engagement Timeline flush — every 5s, turn the rolling load
+  // buffer into one labeled engagement point. Uses wall-clock elapsed time
+  // (not the `seconds` state) so the label is accurate even though this
+  // interval is only created once per session.
+  useEffect(() => {
+    if (!sessionId) return
+    const flush = setInterval(() => {
+      const buf = windowBufferRef.current
+      if (buf.length === 0) return
+      const avgLoadInWindow = buf.reduce((a, b) => a + b, 0) / buf.length
+      const engagement = Math.max(0, Math.round(100 - avgLoadInWindow))
+      const elapsed = sessionStartRef.current ? Math.round((Date.now() - sessionStartRef.current) / 1000) : 0
+      const mins = Math.floor(elapsed / 60)
+      const secs = elapsed % 60
+      const label = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
+      timelineRef.current = [...timelineRef.current, { t: label, engagement }].slice(-24)
+      windowBufferRef.current = []
+      forceUpdate(n => n + 1)
+    }, 5000)
+    return () => clearInterval(flush)
   }, [sessionId])
 
   async function handleDone() {
@@ -924,6 +985,7 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
   }))
 
   const worthCheckIn = !isCalibrating && avgLoad >= 55
+  const liveInsight = !isCalibrating ? computeLiveInsight(timelineRef.current) : null
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative' }}>
@@ -1026,7 +1088,7 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
           position: 'absolute', bottom: 0, left: 0, right: 0, zIndex: 4,
           background: dark ? 'rgba(22,37,53,0.95)' : 'rgba(240,246,252,0.95)',
           borderTopLeftRadius: 20, borderTopRightRadius: 20,
-          padding: '10px 16px', backdropFilter: 'blur(12px)',
+          padding: '10px 16px 12px', backdropFilter: 'blur(12px)',
         }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span style={{ fontSize: 12, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c' }}>
@@ -1035,6 +1097,7 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
                 : `Session avg cognitive load: ${Math.round(avgLoad)}`}
             </span>
           </div>
+
           {worthCheckIn && (
             <div style={{ marginTop: 6, display: 'flex', gap: 6, alignItems: 'center' }}>
               <div style={{ width: 8, height: 8, borderRadius: 4, background: '#e8b86d' }} />
@@ -1043,13 +1106,44 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
               </span>
             </div>
           )}
+
+          {/* Live Engagement Timeline + Insight */}
+          {!isCalibrating && timelineRef.current.length >= 2 && (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 2 }}>
+                <span style={{ fontSize: 9, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.4 }}>
+                  LIVE ENGAGEMENT
+                </span>
+              </div>
+              <div style={{ height: 42 }}>
+                <ResponsiveContainer width="100%" height={42}>
+                  <LineChart data={timelineRef.current} margin={{ top: 2, right: 2, bottom: 0, left: 2 }}>
+                    <Line type="monotone" dataKey="engagement" stroke="#5bb8a0" strokeWidth={2}
+                      dot={false} isAnimationActive={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+              {liveInsight && (
+                <div style={{ marginTop: 4, display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <div style={{
+                    width: 8, height: 8, borderRadius: 4, flexShrink: 0,
+                    background: liveInsight.tone === 'warn' ? '#e8b86d' : liveInsight.tone === 'good' ? '#5bb8a0' : '#8fa8c8',
+                  }} />
+                  <span style={{ fontSize: 11, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>
+                    {liveInsight.text}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
   )
 }
+
 // ─── Screen: Reports ──────────────────────────────────────────────────────────
-function ReportsScreen({ onStudent, dark }: { onStudent: (s: any) => void; dark: boolean }) {
+function ReportsScreen({ onStudent, onWeekly, dark }: { onStudent: (s: any) => void; onWeekly: () => void; dark: boolean }) {
   const [data, setData] = useState<{
     students: { name: string; engagementAvg: number; flag: boolean }[]
     avgEngagement: number | null
@@ -1085,9 +1179,20 @@ function ReportsScreen({ onStudent, dark }: { onStudent: (s: any) => void; dark:
 
   return (
     <div className="phone-scroll" style={{ flex: 1, padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <div>
-        <h2 style={{ margin: '0 0 2px', fontSize: 20, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Reports</h2>
-        <p style={{ margin: 0, fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>All sessions</p>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div>
+          <h2 style={{ margin: '0 0 2px', fontSize: 20, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Reports</h2>
+          <p style={{ margin: 0, fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>All sessions</p>
+        </div>
+        <button onClick={onWeekly} style={{
+          display: 'flex', alignItems: 'center', gap: 6,
+          padding: '9px 14px', borderRadius: 12,
+          background: 'linear-gradient(135deg, #3d84a8, #5bb8a0)',
+          border: 'none', cursor: 'pointer',
+        }}>
+          {icons.sparkle('white')}
+          <span style={{ fontSize: 12, fontWeight: 700, color: 'white' }}>AI Weekly</span>
+        </button>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
@@ -1148,6 +1253,139 @@ function ReportsScreen({ onStudent, dark }: { onStudent: (s: any) => void; dark:
             </LineChart>
           </ResponsiveContainer>
         </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Screen: AI Weekly Report ──────────────────────────────────────────────────
+function WeeklyReportScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
+  const [data, setData] = useState<any>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    apiGet('/api/reports/weekly')
+      .then(setData)
+      .catch(() => setData(null))
+      .finally(() => setLoading(false))
+  }, [])
+
+  const card = { padding: '16px', borderRadius: 16, background: dark ? '#162535' : '#ffffff', border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}` }
+  const sectionLabel = { margin: '0 0 10px', fontSize: 11, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.4 } as const
+
+  return (
+    <div className="phone-scroll" style={{ flex: 1, padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 14, paddingBottom: 28 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <button onClick={onBack} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4 }}>
+          {icons.chevronLeft(dark ? '#e2edf6' : '#1a2b3c')}
+        </button>
+        <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>AI Weekly Report</h2>
+      </div>
+
+      {loading ? (
+        <p style={{ fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', textAlign: 'center', marginTop: 20 }}>Generating report…</p>
+      ) : !data || !data.available ? (
+        <p style={{ fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', textAlign: 'center', marginTop: 20 }}>
+          Not enough session data yet to build a weekly report. Run a few Mood Monitor sessions first.
+        </p>
+      ) : (
+        <>
+          {/* Narrative summary */}
+          <div style={{
+            ...card,
+            background: dark ? 'linear-gradient(135deg,#152a3a,#12251f)' : 'linear-gradient(135deg,#eef8f5,#deedf8)',
+            border: `1.5px solid ${dark ? '#2a4458' : '#c8eae0'}`,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+              {icons.sparkle(dark ? '#8ecfba' : '#3a8870')}
+              <p style={{ margin: 0, fontSize: 12, fontWeight: 800, color: dark ? '#8ecfba' : '#3a8870', letterSpacing: 0.3 }}>
+                THIS WEEK AT A GLANCE
+              </p>
+            </div>
+            <p style={{ margin: 0, fontSize: 13.5, lineHeight: 1.7, color: dark ? '#e2edf6' : '#1a2b3c', fontWeight: 500 }}>
+              {data.narrative}
+            </p>
+          </div>
+
+          {/* Stat row */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+            {[
+              { label: 'Avg Engagement', value: `${data.avgEngagement}%`, color: '#3d84a8' },
+              {
+                label: 'vs Prior Period',
+                value: data.prevAvgEngagement != null
+                  ? `${data.avgEngagement - data.prevAvgEngagement >= 0 ? '+' : ''}${data.avgEngagement - data.prevAvgEngagement}%`
+                  : '—',
+                color: data.prevAvgEngagement != null && data.avgEngagement - data.prevAvgEngagement < 0 ? '#e8b86d' : '#5bb8a0',
+              },
+              { label: 'Flagged', value: String(data.flaggedCount), color: '#e8b86d' },
+            ].map(({ label, value, color }) => (
+              <div key={label} style={{ padding: '12px 10px', borderRadius: 14, textAlign: 'center', background: dark ? '#162535' : '#ffffff', border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}` }}>
+                <div style={{ fontSize: 15, fontWeight: 800, color, marginBottom: 2 }}>{value}</div>
+                <div style={{ fontSize: 10, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 600, lineHeight: 1.3 }}>{label}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Daily engagement chart */}
+          <div style={card}>
+            <p style={sectionLabel}>DAILY ENGAGEMENT THIS WEEK</p>
+            <ResponsiveContainer width="100%" height={140}>
+              <BarChart data={data.dailyEngagement} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={dark ? '#2a4458' : '#e8f0f8'} />
+                <XAxis dataKey="date" tick={{ fontSize: 9, fill: dark ? '#7aa5c0' : '#6b8ba4', fontFamily: 'Manrope' }} tickFormatter={(d: string) => d.slice(5)} />
+                <YAxis domain={[0, 100]} tick={{ fontSize: 9, fill: dark ? '#7aa5c0' : '#6b8ba4', fontFamily: 'Manrope' }} />
+                <Tooltip contentStyle={{ background: dark ? '#162535' : '#fff', border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`, borderRadius: 8, fontSize: 11, fontFamily: 'Manrope' }} />
+                <Bar dataKey="avgEngagement" radius={[6, 6, 0, 0]}>
+                  {data.dailyEngagement.map((_: any, i: number) => <Cell key={i} fill="#3d84a8" />)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
+          {/* Most improved / declined */}
+          {(data.mostImproved || data.mostDeclined) && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {data.mostImproved && (
+                <div style={{ ...card, display: 'flex', alignItems: 'center', gap: 10, border: '1.5px solid #5bb8a0' }}>
+                  {icons.trendUp('#5bb8a0')}
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c' }}>{data.mostImproved.name}</div>
+                    <div style={{ fontSize: 11, color: '#5bb8a0', fontWeight: 600 }}>Most improved · +{Math.round(data.mostImproved.delta)} points</div>
+                  </div>
+                </div>
+              )}
+              {data.mostDeclined && (
+                <div style={{ ...card, display: 'flex', alignItems: 'center', gap: 10, border: '1.5px solid #e8b86d' }}>
+                  {icons.trendDown('#e8b86d')}
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c' }}>{data.mostDeclined.name}</div>
+                    <div style={{ fontSize: 11, color: '#e8b86d', fontWeight: 600 }}>Biggest drop · {Math.round(data.mostDeclined.delta)} points</div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Per-student list */}
+          <div style={card}>
+            <p style={sectionLabel}>STUDENT ENGAGEMENT THIS WEEK</p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {data.students.map((s: any) => (
+                <div key={s.name} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div style={{ width: 90, fontSize: 11, fontWeight: 600, color: dark ? '#e2edf6' : '#1a2b3c', flexShrink: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {s.name}
+                  </div>
+                  <div style={{ flex: 1, height: 8, borderRadius: 4, background: dark ? '#1a2e40' : '#eef3f8', overflow: 'hidden' }}>
+                    <div style={{ height: '100%', borderRadius: 4, width: `${s.engagementAvg}%`, background: s.flag ? 'linear-gradient(90deg,#e8b86d,#d4a050)' : 'linear-gradient(90deg,#3d84a8,#5bb8a0)' }} />
+                  </div>
+                  <div style={{ width: 34, fontSize: 11, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c', textAlign: 'right' }}>{s.engagementAvg}%</div>
+                  {s.flag && icons.flag()}
+                </div>
+              ))}
+            </div>
+          </div>
+        </>
       )}
     </div>
   )
@@ -1686,7 +1924,7 @@ export default function App() {
     setScreen(map[tab])
   }
 
-  const needsNav = ['home', 'students', 'mood', 'reports', 'report-detail', 'student-detail', 'settings'].includes(screen)
+  const needsNav = ['home', 'students', 'mood', 'reports', 'report-detail', 'weekly-report', 'student-detail', 'settings'].includes(screen)
   const fullscreen = ['attendance', 'mood'].includes(screen)
 
   return (
@@ -1698,8 +1936,9 @@ export default function App() {
         {screen === 'registration' && <RegistrationScreen dark={dark} onBack={() => setScreen('home')} />}
         {screen === 'attendance' && <AttendanceScreen dark={dark} onBack={() => setScreen('home')} />}
         {screen === 'mood' && <MoodScreen dark={dark} onBack={() => { setScreen('home'); setNavTab('home') }} />}
-        {screen === 'reports' && <ReportsScreen dark={dark} onStudent={s => { setSelectedStudent(s); setScreen('report-detail') }} />}
+        {screen === 'reports' && <ReportsScreen dark={dark} onStudent={s => { setSelectedStudent(s); setScreen('report-detail') }} onWeekly={() => setScreen('weekly-report')} />}
         {screen === 'report-detail' && selectedStudent && <ReportDetailScreen dark={dark} student={selectedStudent} onBack={() => setScreen('reports')} />}
+        {screen === 'weekly-report' && <WeeklyReportScreen dark={dark} onBack={() => setScreen('reports')} />}
         {screen === 'students' && <StudentsScreen dark={dark} onStudent={s => { setSelectedStudent(s); setScreen('student-detail') }} />}
         {screen === 'student-detail' && selectedStudent && <StudentDetailScreen dark={dark} student={selectedStudent} onBack={() => setScreen('students')} />}
         {screen === 'settings' && <SettingsScreen dark={dark} onToggleDark={() => setDark(d => !d)} />}
