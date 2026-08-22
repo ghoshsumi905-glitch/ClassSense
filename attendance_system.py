@@ -191,16 +191,38 @@ class AttendanceSystem:
 
     # ---------- recognition ----------
 
+# ---------- recognition ----------
+
     def recognize_faces(self, frame):
         """Return a list of recognized names found in the frame. Uses two-pass
         matching: primary tolerance and an optional relaxed tolerance to try and
         capture partial/blurred faces. Returns list of names (lowercased) or "Unknown-<i>" placeholders.
+
+        IMPORTANT: downscaling here is now ADAPTIVE, not a fixed 4x shrink.
+        The frontend already downscales frames to ~480px wide before sending
+        (to keep uploads fast on Render's free tier). A fixed 0.25x shrink on
+        top of that used to produce ~120px-wide frames -- far too small for
+        the face detector to find anything, which silently broke attendance
+        even though registered encodings were present and correct.
+
+        Instead, we only shrink further if the incoming frame is LARGER than
+        our target width. Frames already at or below the target are left
+        alone. This keeps things fast on big frames (e.g. local dev sending
+        full webcam resolution) without destroying detectability on frames
+        the frontend has already sized down.
         """
         results = []
         if len(self.known_face_encodings) == 0:
             return []
 
-        small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+        h, w = frame.shape[:2]
+        target_width = 400  # sweet spot: fast enough, still detectable faces
+        scale = min(1.0, target_width / w)
+        if scale < 1.0:
+            small = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+        else:
+            small = frame  # already small (e.g. frontend-downscaled) -- don't shrink further
+
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
 
         locations = face_recognition.face_locations(rgb)
