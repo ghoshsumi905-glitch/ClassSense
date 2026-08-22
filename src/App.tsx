@@ -3,12 +3,14 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   BarChart, Bar, Cell, PieChart, Pie, Sector
 } from 'recharts'
-import { apiPost, apiGet } from './api'
+import { apiPost, apiPostJson, apiGet } from './api'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 type Screen =
   | 'login'
   | 'consent'
+  | 'roster-import'
+  | 'student-consent'
   | 'home'
   | 'registration'
   | 'attendance'
@@ -21,6 +23,17 @@ type Screen =
   | 'settings'
 
 type NavTab = 'home' | 'students' | 'monitor' | 'reports' | 'settings'
+
+// A roster entry as returned by GET/POST /api/students/roster --
+// consent_status starts 'pending' at import and face_registered starts
+// false until RegistrationScreen successfully saves a face for them.
+type ConsentStatus = 'pending' | 'biometric' | 'non_biometric'
+type RosterStudent = {
+  id: number
+  name: string
+  consent_status: ConsentStatus
+  face_registered: boolean
+}
 
 // ─── Mock Data ────────────────────────────────────────────────────────────────
 const STUDENTS = [
@@ -206,6 +219,9 @@ const icons = {
   sparkle: (c = 'currentColor') => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3l1.9 5.3L19 10l-5.1 1.7L12 17l-1.9-5.3L5 10l5.1-1.7L12 3z" /><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z" /></svg>,
   trendUp: (c = 'currentColor') => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18" /><polyline points="17 6 23 6 23 12" /></svg>,
   trendDown: (c = 'currentColor') => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 18 13.5 8.5 8.5 13.5 1 6" /><polyline points="17 18 23 18 23 12" /></svg>,
+  upload: (c = 'currentColor') => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></svg>,
+  fingerprint: (c = 'currentColor') => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2a8 8 0 0 0-8 8c0 2 .5 4 2 6" /><path d="M12 2a8 8 0 0 1 8 8c0 3-1 5-2 7" /><path d="M9 5.5A5 5 0 0 1 17 10c0 2-.3 3.7-1 5" /><path d="M7 20c1.5-2 2-4 2-6a3 3 0 0 1 6 0c0 1.2-.2 2.3-.6 3.4" /><path d="M12 10v3" /></svg>,
+  clipboard: (c = 'currentColor') => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M9 2h6a1 1 0 0 1 1 1v2H8V3a1 1 0 0 1 1-1z" /><rect x="4" y="4" width="16" height="18" rx="2" /><line x1="8" y1="11" x2="16" y2="11" /><line x1="8" y1="15" x2="16" y2="15" /></svg>,
 }
 
 // ─── Layout Shell ─────────────────────────────────────────────────────────────
@@ -396,14 +412,16 @@ function LoginScreen({ onNext, dark }: { onNext: (details: LoginDetails) => void
   )
 }
 
-// ─── Screen: Consent ─────────────────────────────────────────────────────────
-function ConsentScreen({ onAccept, dark }: { onAccept: () => void; dark: boolean }) {
+// ─── Screen: Consent (teacher-level acknowledgement) ──────────────────────────
+function ConsentScreen({ onAccept, dark, creating, error }: {
+  onAccept: () => void; dark: boolean; creating: boolean; error: string | null
+}) {
   const [agreed, setAgreed] = useState(false)
   const items = [
     { icon: icons.camera, title: 'Camera access', desc: 'Used only during active sessions for attendance and engagement detection.' },
     { icon: icons.smile, title: 'Emotion analysis', desc: 'Broad mood states (Focused, Calm, Distracted) help you understand class dynamics — no individual scoring is stored.' },
     { icon: icons.lock, title: 'Data stays local', desc: 'Face data is processed on-device. No biometric data leaves your school\'s network.' },
-    { icon: icons.shield, title: 'Student privacy', desc: 'Parents and guardians are notified via your institution. You can delete any student\'s data at any time.' },
+    { icon: icons.shield, title: 'Student privacy', desc: 'Each student chooses biometric or non-biometric attendance on the next screen. You can change any student\'s choice at any time.' },
   ]
   return (
     <div className="phone-scroll" style={{ flex: 1, padding: '24px 24px 28px', display: 'flex', flexDirection: 'column' }}>
@@ -459,14 +477,259 @@ function ConsentScreen({ onAccept, dark }: { onAccept: () => void; dark: boolean
         </p>
       </div>
 
-      <button onClick={onAccept} disabled={!agreed} style={{
+      {error && (
+        <p style={{ margin: '10px 0 0', fontSize: 12, color: '#e8b86d', fontWeight: 600, textAlign: 'center' }}>{error}</p>
+      )}
+
+      <button onClick={onAccept} disabled={!agreed || creating} style={{
         marginTop: 14, width: '100%', padding: '15px', borderRadius: 14,
-        background: agreed ? 'linear-gradient(135deg, #3d84a8, #5bb8a0)' : (dark ? '#2a4458' : '#d4e4ef'),
-        border: 'none', color: agreed ? 'white' : (dark ? '#4a6880' : '#a0b8c8'),
-        fontSize: 16, fontWeight: 700, cursor: agreed ? 'pointer' : 'not-allowed',
+        background: (agreed && !creating) ? 'linear-gradient(135deg, #3d84a8, #5bb8a0)' : (dark ? '#2a4458' : '#d4e4ef'),
+        border: 'none', color: (agreed && !creating) ? 'white' : (dark ? '#4a6880' : '#a0b8c8'),
+        fontSize: 16, fontWeight: 700, cursor: (agreed && !creating) ? 'pointer' : 'not-allowed',
         transition: 'all 0.2s',
       }}>
-        Get started
+        {creating ? 'Setting up your class…' : 'Get started'}
+      </button>
+    </div>
+  )
+}
+
+// ─── Screen: Roster Import ─────────────────────────────────────────────────────
+// Step 2 of the workflow. Teacher pastes names and/or uploads a CSV; both
+// sources are merged, deduped, and sent to POST /api/students/roster in one
+// go. Every imported name starts consent_status='pending' server-side --
+// the next screen (StudentConsentScreen) is where that gets resolved.
+function parseNamesFromCsvText(text: string): string[] {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+  const names: string[] = []
+  for (const line of lines) {
+    const firstCell = line.split(',')[0]?.trim().replace(/^"|"$/g, '')
+    if (!firstCell) continue
+    // Skip an obvious header row ("name", "student name", "full name", ...)
+    if (/^(name|student|student name|full name|roster)$/i.test(firstCell)) continue
+    names.push(firstCell)
+  }
+  return names
+}
+
+function RosterImportScreen({ classId, dark, onImported }: {
+  classId: number
+  dark: boolean
+  onImported: (roster: RosterStudent[]) => void
+}) {
+  const [pasteText, setPasteText] = useState('')
+  const [csvFileName, setCsvFileName] = useState<string | null>(null)
+  const [csvNames, setCsvNames] = useState<string[]>([])
+  const [importing, setImporting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const pastedNames = pasteText
+    .split(/\r?\n|,/)
+    .map(n => n.trim())
+    .filter(Boolean)
+
+  const allNames = Array.from(new Set([...pastedNames, ...csvNames]))
+
+  async function handleFile(file: File) {
+    setError(null)
+    try {
+      const text = await file.text()
+      const names = parseNamesFromCsvText(text)
+      if (names.length === 0) {
+        setError('Could not find any names in that file — check it has one name per row.')
+        return
+      }
+      setCsvFileName(file.name)
+      setCsvNames(names)
+    } catch {
+      setError('Could not read that file. Try a plain .csv export.')
+    }
+  }
+
+  async function handleImport() {
+    if (allNames.length === 0) return
+    setImporting(true)
+    setError(null)
+    try {
+      await apiPostJson('/api/students/roster', { class_id: classId, names: allNames })
+      const roster = await apiGet(`/api/students/roster?class_id=${classId}`)
+      onImported(roster.students || [])
+    } catch {
+      setError('Could not import the roster. Check that the backend is running.')
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const inp = {
+    width: '100%', padding: '13px 16px', borderRadius: 12,
+    border: `1.5px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
+    background: dark ? '#1a2e40' : '#f8fbfe', fontSize: 14,
+    color: dark ? '#e2edf6' : '#1a2b3c', outline: 'none',
+    fontFamily: 'Manrope, sans-serif', fontWeight: 500, resize: 'vertical' as const,
+  }
+  const label = { fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.4, display: 'block', marginBottom: 6 }
+
+  return (
+    <div className="phone-scroll" style={{ flex: 1, padding: '24px 24px 28px', display: 'flex', flexDirection: 'column', gap: 18 }}>
+      <div>
+        <h2 style={{ margin: '0 0 4px', fontSize: 22, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Import your roster</h2>
+        <p style={{ margin: 0, fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', lineHeight: 1.6, fontWeight: 500 }}>
+          Paste names, upload a CSV, or both — they'll be combined into one roster for this class.
+        </p>
+      </div>
+
+      {/* Paste */}
+      <div>
+        <label style={label}>PASTE NAMES (one per line, or comma-separated)</label>
+        <textarea
+          value={pasteText} onChange={e => setPasteText(e.target.value)}
+          rows={5}
+          placeholder={'Amara Diallo\nBen Hartwell\nCleo Nakamura'}
+          style={inp}
+        />
+      </div>
+
+      {/* CSV upload */}
+      <div>
+        <label style={label}>OR UPLOAD A CSV</label>
+        <input
+          ref={fileInputRef} type="file" accept=".csv,text/csv"
+          style={{ display: 'none' }}
+          onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f) }}
+        />
+        <button onClick={() => fileInputRef.current?.click()} style={{
+          width: '100%', padding: '13px 16px', borderRadius: 12,
+          border: `1.5px dashed ${dark ? '#2a4458' : '#c8d8e4'}`,
+          background: dark ? '#162535' : '#ffffff',
+          display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer',
+        }}>
+          {icons.upload('#3d84a8')}
+          <span style={{ fontSize: 13, fontWeight: 600, color: dark ? '#e2edf6' : '#1a2b3c' }}>
+            {csvFileName ? csvFileName : 'Choose CSV file…'}
+          </span>
+          {csvNames.length > 0 && (
+            <span style={{ marginLeft: 'auto', fontSize: 11, fontWeight: 700, color: '#5bb8a0' }}>{csvNames.length} found</span>
+          )}
+        </button>
+        <p style={{ margin: '6px 0 0', fontSize: 11, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>
+          Uses the first column of each row. A header row like "Name" is skipped automatically.
+        </p>
+      </div>
+
+      {/* Combined preview */}
+      {allNames.length > 0 && (
+        <div style={{
+          padding: '12px 14px', borderRadius: 12,
+          background: dark ? '#162535' : '#ffffff',
+          border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
+        }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', marginBottom: 6, letterSpacing: 0.4 }}>
+            {allNames.length} STUDENT{allNames.length === 1 ? '' : 'S'} READY TO IMPORT
+          </div>
+          <div style={{ fontSize: 12, color: dark ? '#e2edf6' : '#1a2b3c', lineHeight: 1.7, fontWeight: 500 }}>
+            {allNames.slice(0, 6).join(', ')}{allNames.length > 6 ? `, +${allNames.length - 6} more` : ''}
+          </div>
+        </div>
+      )}
+
+      {error && <p style={{ margin: 0, fontSize: 12, color: '#e8b86d', fontWeight: 600 }}>{error}</p>}
+
+      <button onClick={handleImport} disabled={allNames.length === 0 || importing} style={{
+        marginTop: 'auto', width: '100%', padding: '15px', borderRadius: 14,
+        background: (allNames.length > 0 && !importing) ? 'linear-gradient(135deg, #3d84a8, #5bb8a0)' : (dark ? '#2a4458' : '#d4e4ef'),
+        border: 'none', color: (allNames.length > 0 && !importing) ? 'white' : (dark ? '#4a6880' : '#a0b8c8'),
+        fontSize: 16, fontWeight: 700, cursor: (allNames.length > 0 && !importing) ? 'pointer' : 'not-allowed',
+      }}>
+        {importing ? 'Importing…' : `Import ${allNames.length || ''} student${allNames.length === 1 ? '' : 's'}`}
+      </button>
+    </div>
+  )
+}
+
+// ─── Screen: Student Consent ───────────────────────────────────────────────────
+// Step 3 of the workflow. Teacher (standing in for each student, or handing
+// the device around) records whether each student consents to biometric
+// recognition or wants the non-biometric alternative. This is what
+// RegistrationScreen checks before it will ever compute a face encoding.
+function StudentConsentScreen({ classId, roster, dark, onDone }: {
+  classId: number
+  roster: RosterStudent[]
+  dark: boolean
+  onDone: (roster: RosterStudent[]) => void
+}) {
+  const [students, setStudents] = useState<RosterStudent[]>(roster)
+  const [savingId, setSavingId] = useState<number | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  async function setConsent(id: number, status: ConsentStatus) {
+    setSavingId(id)
+    setError(null)
+    try {
+      await apiPostJson(`/api/students/${id}/consent`, { consent_status: status })
+      setStudents(prev => prev.map(s => s.id === id ? { ...s, consent_status: status } : s))
+    } catch {
+      setError('Could not save that choice. Check the backend connection and try again.')
+    } finally {
+      setSavingId(null)
+    }
+  }
+
+  const resolvedCount = students.filter(s => s.consent_status !== 'pending').length
+
+  const choiceBtn = (active: boolean, color: string) => ({
+    flex: 1, padding: '8px 6px', borderRadius: 9, fontSize: 11, fontWeight: 700,
+    border: `1.5px solid ${active ? color : (dark ? '#2a4458' : '#d4e4ef')}`,
+    background: active ? color + '22' : 'transparent',
+    color: active ? color : (dark ? '#7aa5c0' : '#6b8ba4'),
+    cursor: 'pointer',
+  })
+
+  return (
+    <div className="phone-scroll" style={{ flex: 1, padding: '24px 24px 28px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div>
+        <h2 style={{ margin: '0 0 4px', fontSize: 22, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Student consent</h2>
+        <p style={{ margin: 0, fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', lineHeight: 1.6, fontWeight: 500 }}>
+          {resolvedCount}/{students.length} recorded. Students who choose "Non-biometric" or are left pending will use manual roll-call instead of face recognition.
+        </p>
+      </div>
+
+      {error && <p style={{ margin: 0, fontSize: 12, color: '#e8b86d', fontWeight: 600 }}>{error}</p>}
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {students.map(s => (
+          <div key={s.id} style={{
+            padding: '12px 14px', borderRadius: 14,
+            background: dark ? '#162535' : '#ffffff',
+            border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
+            opacity: savingId === s.id ? 0.6 : 1,
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c', marginBottom: 8 }}>{s.name}</div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button disabled={savingId === s.id} onClick={() => setConsent(s.id, 'biometric')}
+                style={choiceBtn(s.consent_status === 'biometric', '#5bb8a0')}>
+                Biometric
+              </button>
+              <button disabled={savingId === s.id} onClick={() => setConsent(s.id, 'non_biometric')}
+                style={choiceBtn(s.consent_status === 'non_biometric', '#e8b86d')}>
+                Non-biometric
+              </button>
+              <button disabled={savingId === s.id} onClick={() => setConsent(s.id, 'pending')}
+                style={choiceBtn(s.consent_status === 'pending', '#8fa8c8')}>
+                Ask later
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <button onClick={() => onDone(students)} style={{
+        marginTop: 'auto', width: '100%', padding: '15px', borderRadius: 14,
+        background: 'linear-gradient(135deg, #3d84a8, #5bb8a0)',
+        border: 'none', color: 'white', fontSize: 16, fontWeight: 700, cursor: 'pointer',
+      }}>
+        Continue to class
       </button>
     </div>
   )
@@ -589,14 +852,27 @@ function HomeScreen({ onNav, onScreen, dark, professorName, classYear, periodLab
 }
 
 // ─── Screen: Face Registration ────────────────────────────────────────────────
-function RegistrationScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
+// Now class-scoped: the teacher picks a student from the roster (filtered
+// to those who gave biometric consent and don't yet have a face saved)
+// instead of typing a free-text name. This is what lets the backend refuse
+// to compute an encoding for anyone who chose non-biometric or is pending.
+function RegistrationScreen({ onBack, dark, classId, roster, onRegistered }: {
+  onBack: () => void
+  dark: boolean
+  classId: number | null
+  roster: RosterStudent[]
+  onRegistered: (studentId: number) => void
+}) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const [studentName, setStudentName] = useState('')
+  const [selectedId, setSelectedId] = useState<number | null>(null)
   const [capturedBlobs, setCapturedBlobs] = useState<Blob[]>([])
   const [step, setStep] = useState<'name' | 'capture' | 'review' | 'saving' | 'done'>('name')
   const [error, setError] = useState<string | null>(null)
-  const total =15// increased from 8 to 20 to improve registration robustness (more angle samples)
+  const total = 15
+
+  const eligible = roster.filter(s => s.consent_status === 'biometric' && !s.face_registered)
+  const selected = roster.find(s => s.id === selectedId) || null
 
   useEffect(() => {
     if (step !== 'capture') return
@@ -620,15 +896,19 @@ function RegistrationScreen({ onBack, dark }: { onBack: () => void; dark: boolea
   }
 
   async function handleSave() {
+    if (!selected) return
     setStep('saving')
     const form = new FormData()
-    form.append('name', studentName)
+    form.append('name', selected.name)
+    if (classId != null) form.append('class_id', String(classId))
+    form.append('student_id', String(selected.id))
     capturedBlobs.forEach((blob, i) => form.append('images', blob, `angle_${i}.jpg`))
     try {
       await apiPost('/api/students/register', form)
+      onRegistered(selected.id)
       setStep('done')
     } catch (e) {
-      setError('Failed to save. Check that the backend is running.')
+      setError('Failed to save. Check that the backend is running and this student has biometric consent recorded.')
       setStep('review')
     }
   }
@@ -641,20 +921,43 @@ function RegistrationScreen({ onBack, dark }: { onBack: () => void; dark: boolea
         </button>
         <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Register student</h2>
       </div>
-      <label style={{ fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4' }}>STUDENT NAME</label>
-      <input value={studentName} onChange={e => setStudentName(e.target.value)}
-        placeholder="e.g. Amara Diallo"
-        style={{
-          padding: '13px 16px', borderRadius: 12, border: `1.5px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
-          background: dark ? '#1a2e40' : '#f8fbfe', fontSize: 15, color: dark ? '#e2edf6' : '#1a2b3c',
-          fontFamily: 'Manrope, sans-serif', fontWeight: 500,
-        }} />
-      <button onClick={() => studentName.trim() && setStep('capture')} disabled={!studentName.trim()} style={{
-        padding: '15px', borderRadius: 14,
-        background: studentName.trim() ? 'linear-gradient(135deg, #3d84a8, #5bb8a0)' : (dark ? '#2a4458' : '#d4e4ef'),
-        border: 'none', color: 'white', fontSize: 16, fontWeight: 700,
-        cursor: studentName.trim() ? 'pointer' : 'not-allowed',
-      }}>Start capture</button>
+
+      {classId == null ? (
+        <p style={{ fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4' }}>
+          No class is active yet — go through class setup from the home screen first.
+        </p>
+      ) : eligible.length === 0 ? (
+        <p style={{ fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', lineHeight: 1.6 }}>
+          No students are waiting on face registration. Everyone with biometric consent already has a face saved,
+          or no one has chosen "Biometric" yet in student consent.
+        </p>
+      ) : (
+        <>
+          <label style={{ fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4' }}>
+            SELECT STUDENT ({eligible.length} awaiting registration)
+          </label>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {eligible.map(s => (
+              <button key={s.id} onClick={() => setSelectedId(s.id)} style={{
+                textAlign: 'left', padding: '12px 14px', borderRadius: 12,
+                border: `1.5px solid ${selectedId === s.id ? '#3d84a8' : (dark ? '#2a4458' : '#d4e4ef')}`,
+                background: selectedId === s.id ? (dark ? '#1a2e40' : '#eef4fb') : (dark ? '#162535' : '#ffffff'),
+                cursor: 'pointer', fontSize: 14, fontWeight: 600, color: dark ? '#e2edf6' : '#1a2b3c',
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}>
+                {icons.fingerprint(selectedId === s.id ? '#3d84a8' : (dark ? '#7aa5c0' : '#6b8ba4'))}
+                {s.name}
+              </button>
+            ))}
+          </div>
+          <button onClick={() => selectedId && setStep('capture')} disabled={!selectedId} style={{
+            padding: '15px', borderRadius: 14,
+            background: selectedId ? 'linear-gradient(135deg, #3d84a8, #5bb8a0)' : (dark ? '#2a4458' : '#d4e4ef'),
+            border: 'none', color: 'white', fontSize: 16, fontWeight: 700,
+            cursor: selectedId ? 'pointer' : 'not-allowed',
+          }}>Start capture</button>
+        </>
+      )}
     </div>
   )
 
@@ -702,7 +1005,7 @@ function RegistrationScreen({ onBack, dark }: { onBack: () => void; dark: boolea
         </button>
         <div>
           <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Capture angles</h2>
-          <p style={{ margin: 0, fontSize: 12, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>{studentName}</p>
+          <p style={{ margin: 0, fontSize: 12, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>{selected?.name}</p>
         </div>
       </div>
 
@@ -750,11 +1053,25 @@ function RegistrationScreen({ onBack, dark }: { onBack: () => void; dark: boolea
 }
 
 // ─── Screen: Attendance ───────────────────────────────────────────────────────
-function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
+// Now class-scoped (class_id sent on start) and includes the review queue:
+// uncertain matches accumulate from /api/attendance/frame and are resolved
+// here via /api/attendance/review-correct -- confirm as the best guess, pick
+// a different roster name, or dismiss as "not present".
+type UncertainMatch = { name: string; confidence: number }
+
+function AttendanceScreen({ onBack, dark, classId, roster }: {
+  onBack: () => void
+  dark: boolean
+  classId: number | null
+  roster: RosterStudent[]
+}) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [presentStudents, setPresentStudents] = useState<Set<string>>(new Set())
+  const [uncertainQueue, setUncertainQueue] = useState<UncertainMatch[]>([])
+  const [reviewOpen, setReviewOpen] = useState(false)
+  const [correctingName, setCorrectingName] = useState<string | null>(null)
   const [seconds, setSeconds] = useState(0)
   const [sheetOpen, setSheetOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -774,12 +1091,13 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
       }
       const form = new FormData()
       form.append('class_name', 'Year 10 Science')
+      if (classId != null) form.append('class_id', String(classId))
       const data = await apiPost('/api/attendance/start', form)
       setSessionId(data.session_id)
     }
     init()
     return () => { stream?.getTracks().forEach(t => t.stop()); stoppedRef.current = true }
-  }, [])
+  }, [classId])
 
   // 2. Timer for the on-screen clock
   useEffect(() => {
@@ -833,12 +1151,32 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
             return next
           })
         }
+        if (result.uncertain_queue) {
+          setUncertainQueue(result.uncertain_queue)
+        }
       } catch (e) { /* skip failed frame, loop tries again next tick */ }
     }
 
     captureAndSendLoop()
     return () => { stoppedRef.current = true }
   }, [sessionId])
+
+  async function resolveUncertain(originalName: string, correctedName: string | null) {
+    if (!sessionId) return
+    try {
+      const result = await apiPostJson('/api/attendance/review-correct', {
+        session_id: sessionId,
+        original_name: originalName,
+        corrected_name: correctedName,
+      })
+      setUncertainQueue(result.uncertain || [])
+      if (result.marked) setPresentStudents(new Set(result.marked))
+    } catch {
+      setError('Could not save that correction — try again.')
+    } finally {
+      setCorrectingName(null)
+    }
+  }
 
   async function handleEnd() {
     stoppedRef.current = true
@@ -852,6 +1190,7 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
 
   const mins = Math.floor(seconds / 60)
   const secs = seconds % 60
+  const rosterNamesForCorrection = roster.map(s => s.name)
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative' }}>
@@ -888,13 +1227,78 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
               {String(mins).padStart(2, '0')}:{String(secs).padStart(2, '0')}
             </span>
           </div>
-          <div style={{
-            background: 'rgba(0,0,0,0.4)', borderRadius: 10, padding: '5px 12px',
-            color: 'white', fontSize: 12, fontWeight: 700, backdropFilter: 'blur(8px)',
-          }}>
-            {presentStudents.size}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {uncertainQueue.length > 0 && (
+              <button onClick={() => setReviewOpen(true)} style={{
+                background: 'rgba(232,184,109,0.85)', border: 'none', borderRadius: 10, padding: '5px 10px',
+                color: '#3a2c0a', fontSize: 12, fontWeight: 800, cursor: 'pointer', backdropFilter: 'blur(8px)',
+              }}>
+                {uncertainQueue.length} to review
+              </button>
+            )}
+            <div style={{
+              background: 'rgba(0,0,0,0.4)', borderRadius: 10, padding: '5px 12px',
+              color: 'white', fontSize: 12, fontWeight: 700, backdropFilter: 'blur(8px)',
+            }}>
+              {presentStudents.size}
+            </div>
           </div>
         </div>
+
+        {/* Review queue overlay */}
+        {reviewOpen && (
+          <div style={{
+            position: 'absolute', inset: 0, background: 'rgba(10,21,32,0.88)', zIndex: 10,
+            display: 'flex', flexDirection: 'column', padding: '50px 16px 20px',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+              <span style={{ color: 'white', fontSize: 15, fontWeight: 800 }}>Review uncertain matches</span>
+              <button onClick={() => setReviewOpen(false)} style={{
+                background: 'rgba(255,255,255,0.15)', border: 'none', borderRadius: 8,
+                padding: '5px 10px', color: 'white', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              }}>Close</button>
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {uncertainQueue.length === 0 && (
+                <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: 13, textAlign: 'center', marginTop: 30 }}>
+                  All caught up — nothing left to review.
+                </p>
+              )}
+              {uncertainQueue.map(u => (
+                <div key={u.name} style={{ background: 'rgba(22,37,53,0.95)', borderRadius: 14, padding: '12px 14px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                    <span style={{ color: 'white', fontSize: 14, fontWeight: 700 }}>Best guess: {u.name}</span>
+                    <span style={{ color: '#e8b86d', fontSize: 12, fontWeight: 700 }}>{u.confidence}% confident</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, marginBottom: correctingName === u.name ? 8 : 0 }}>
+                    <button onClick={() => resolveUncertain(u.name, u.name)} style={{
+                      flex: 1, padding: '8px', borderRadius: 9, border: 'none',
+                      background: '#5bb8a0', color: 'white', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+                    }}>Confirm</button>
+                    <button onClick={() => setCorrectingName(correctingName === u.name ? null : u.name)} style={{
+                      flex: 1, padding: '8px', borderRadius: 9, border: '1.5px solid rgba(255,255,255,0.3)',
+                      background: 'transparent', color: 'white', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+                    }}>Correct</button>
+                    <button onClick={() => resolveUncertain(u.name, null)} style={{
+                      flex: 1, padding: '8px', borderRadius: 9, border: '1.5px solid rgba(255,255,255,0.3)',
+                      background: 'transparent', color: 'rgba(255,255,255,0.7)', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+                    }}>Not present</button>
+                  </div>
+                  {correctingName === u.name && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 140, overflowY: 'auto' }}>
+                      {rosterNamesForCorrection.filter(n => n !== u.name).map(n => (
+                        <button key={n} onClick={() => resolveUncertain(u.name, n)} style={{
+                          textAlign: 'left', padding: '7px 10px', borderRadius: 8, border: 'none',
+                          background: 'rgba(255,255,255,0.08)', color: 'white', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                        }}>{n}</button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <button onClick={() => setSheetOpen(!sheetOpen)} style={{
           position: 'absolute', bottom: 0, left: 0, right: 0,
@@ -2009,12 +2413,19 @@ export default function App() {
   const [selectedStudent, setSelectedStudent] = useState<typeof STUDENTS[0] | null>(null)
 
   // Session/login details collected on the login screen — professor name,
-  // class year, and the selected class period. Currently kept in client
-  // state only (not yet persisted to the backend).
+  // class year, and the selected class period. These now feed straight
+  // into POST /api/classes once the teacher accepts the consent screen.
   const [professorName, setProfessorName] = useState('')
   const [classYear, setClassYear] = useState<ClassYear>(CLASS_YEARS[0])
   const [periodId, setPeriodId] = useState(PERIODS[0].id)
   const periodLabel = PERIODS.find(p => p.id === periodId)?.label ?? PERIODS[0].label
+
+  // Class + roster state, threaded down to RegistrationScreen and
+  // AttendanceScreen so both operate on the right class_id.
+  const [classId, setClassId] = useState<number | null>(null)
+  const [roster, setRoster] = useState<RosterStudent[]>([])
+  const [creatingClass, setCreatingClass] = useState(false)
+  const [classError, setClassError] = useState<string | null>(null)
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark)
@@ -2035,6 +2446,42 @@ export default function App() {
     setScreen('consent')
   }
 
+  // Teacher accepts the camera/consent notice -> create the SchoolClass row
+  // (step 1 of the workflow) -> move on to roster import (step 2).
+  async function handleConsentAccept() {
+    setCreatingClass(true)
+    setClassError(null)
+    try {
+      const cls = await apiPostJson('/api/classes', {
+        professor_name: professorName,
+        class_year: classYear,
+        period_id: periodId,
+        period_label: periodLabel,
+      })
+      setClassId(cls.class_id)
+      setScreen('roster-import')
+    } catch {
+      setClassError('Could not create the class. Check that the backend is running and try again.')
+    } finally {
+      setCreatingClass(false)
+    }
+  }
+
+  function handleRosterImported(imported: RosterStudent[]) {
+    setRoster(imported)
+    setScreen('student-consent')
+  }
+
+  function handleConsentDone(finalRoster: RosterStudent[]) {
+    setRoster(finalRoster)
+    setScreen('home')
+    setNavTab('home')
+  }
+
+  function handleStudentRegistered(studentId: number) {
+    setRoster(prev => prev.map(s => s.id === studentId ? { ...s, face_registered: true } : s))
+  }
+
   const needsNav = ['home', 'students', 'mood', 'reports', 'report-detail', 'weekly-report', 'student-detail', 'settings'].includes(screen)
   const fullscreen = ['attendance', 'mood'].includes(screen)
 
@@ -2042,13 +2489,26 @@ export default function App() {
     <PhoneFrame dark={dark}>
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         {screen === 'login' && <LoginScreen dark={dark} onNext={handleLoginNext} />}
-        {screen === 'consent' && <ConsentScreen dark={dark} onAccept={() => { setScreen('home'); setNavTab('home') }} />}
+        {screen === 'consent' && (
+          <ConsentScreen dark={dark} onAccept={handleConsentAccept} creating={creatingClass} error={classError} />
+        )}
+        {screen === 'roster-import' && classId != null && (
+          <RosterImportScreen dark={dark} classId={classId} onImported={handleRosterImported} />
+        )}
+        {screen === 'student-consent' && classId != null && (
+          <StudentConsentScreen dark={dark} classId={classId} roster={roster} onDone={handleConsentDone} />
+        )}
         {screen === 'home' && (
           <HomeScreen dark={dark} onNav={handleNav} onScreen={s => setScreen(s)}
             professorName={professorName} classYear={classYear} periodLabel={periodLabel} />
         )}
-        {screen === 'registration' && <RegistrationScreen dark={dark} onBack={() => setScreen('home')} />}
-        {screen === 'attendance' && <AttendanceScreen dark={dark} onBack={() => setScreen('home')} />}
+        {screen === 'registration' && (
+          <RegistrationScreen dark={dark} onBack={() => setScreen('home')}
+            classId={classId} roster={roster} onRegistered={handleStudentRegistered} />
+        )}
+        {screen === 'attendance' && (
+          <AttendanceScreen dark={dark} onBack={() => setScreen('home')} classId={classId} roster={roster} />
+        )}
         {screen === 'mood' && <MoodScreen dark={dark} onBack={() => { setScreen('home'); setNavTab('home') }} />}
         {screen === 'reports' && <ReportsScreen dark={dark} onStudent={s => { setSelectedStudent(s); setScreen('report-detail') }} onWeekly={() => setScreen('weekly-report')} />}
         {screen === 'report-detail' && selectedStudent && <ReportDetailScreen dark={dark} student={selectedStudent} onBack={() => setScreen('reports')} />}
@@ -2062,8 +2522,8 @@ export default function App() {
         <BottomNav active={navTab} onNav={handleNav} dark={dark} />
       )}
 
-      {/* Dark mode FAB on login/consent */}
-      {(screen === 'login' || screen === 'consent') && (
+      {/* Dark mode FAB on login/consent/setup screens */}
+      {(screen === 'login' || screen === 'consent' || screen === 'roster-import' || screen === 'student-consent') && (
         <div style={{ position: 'absolute', top: 52, right: 16, zIndex: 10 }}>
           <button onClick={() => setDark(d => !d)} style={{
             width: 34, height: 34, borderRadius: 17,
