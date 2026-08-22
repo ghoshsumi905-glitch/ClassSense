@@ -665,11 +665,12 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
   const [seconds, setSeconds] = useState(0)
   const [sheetOpen, setSheetOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const busyRef = useRef(false)       // prevents overlapping requests
+  const stoppedRef = useRef(false)    // stops the loop cleanly on unmount/end
 
   // 1. Start camera + backend session when screen opens
   useEffect(() => {
     let stream: MediaStream
-
     async function init() {
       try {
         stream = await navigator.mediaDevices.getUserMedia({ video: true })
@@ -678,15 +679,13 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
         setError('Camera access denied. Please allow camera permissions.')
         return
       }
-
       const form = new FormData()
       form.append('class_name', 'Year 10 Science')
       const data = await apiPost('/api/attendance/start', form)
       setSessionId(data.session_id)
     }
     init()
-
-    return () => { stream?.getTracks().forEach(t => t.stop()) }
+    return () => { stream?.getTracks().forEach(t => t.stop()); stoppedRef.current = true }
   }, [])
 
   // 2. Timer for the on-screen clock
@@ -695,36 +694,61 @@ function AttendanceScreen({ onBack, dark }: { onBack: () => void; dark: boolean 
     return () => clearInterval(t)
   }, [])
 
-  // 3. Grab a frame + send it every 800ms, once we have a session
+  // 3. Self-scheduling capture loop — only sends the next frame after the
+  // previous one finishes, so slow requests (Render free tier) never pile up.
+  // Also downscales to max 480px wide before sending, which is both faster
+  // to upload and faster for dlib to encode server-side.
   useEffect(() => {
     if (!sessionId) return
-    const interval = setInterval(async () => {
+    stoppedRef.current = false
+
+    async function captureAndSendLoop() {
+      while (!stoppedRef.current) {
+        if (!busyRef.current) {
+          busyRef.current = true
+          await captureOnce()
+          busyRef.current = false
+        }
+        await new Promise(r => setTimeout(r, 1200)) // pacing between attempts
+      }
+    }
+
+    async function captureOnce() {
       const video = videoRef.current
       const canvas = canvasRef.current
       if (!video || !canvas || video.videoWidth === 0) return
 
-      canvas.width = video.videoWidth
-      canvas.height = video.videoHeight
-      const ctx = canvas.getContext('2d')
-      ctx?.drawImage(video, 0, 0)
+      const scale = Math.min(1, 480 / video.videoWidth)
+      canvas.width = video.videoWidth * scale
+      canvas.height = video.videoHeight * scale
+      canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height)
 
-      canvas.toBlob(async (blob) => {
-        if (!blob) return
-        const form = new FormData()
-        form.append('session_id', sessionId)
-        form.append('image', blob, 'frame.jpg')
-        try {
-          const result = await apiPost('/api/attendance/frame', form)
-          if (result.name && result.name !== 'Unknown') {
-            setPresentStudents(prev => new Set(prev).add(result.name))
-          }
-        } catch (e) { /* skip failed frame, try again next tick */ }
-      }, 'image/jpeg', 0.8)
-    }, 800)
-    return () => clearInterval(interval)
+      const blob: Blob | null = await new Promise(resolve =>
+        canvas.toBlob(resolve, 'image/jpeg', 0.8)
+      )
+      if (!blob) return
+
+      const form = new FormData()
+      form.append('session_id', sessionId!)
+      form.append('image', blob, 'frame.jpg')
+      try {
+        const result = await apiPost('/api/attendance/frame', form)
+        if (result.newly_marked?.length) {
+          setPresentStudents(prev => {
+            const next = new Set(prev)
+            result.newly_marked.forEach((n: string) => next.add(n))
+            return next
+          })
+        }
+      } catch (e) { /* skip failed frame, loop tries again next tick */ }
+    }
+
+    captureAndSendLoop()
+    return () => { stoppedRef.current = true }
   }, [sessionId])
 
   async function handleEnd() {
+    stoppedRef.current = true
     if (sessionId) {
       const form = new FormData()
       form.append('session_id', sessionId)
