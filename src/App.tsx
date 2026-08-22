@@ -97,6 +97,49 @@ function buildMoodTimeline(concern: boolean) {
   }))
 }
 
+// ─── Class / Timeslot config ─────────────────────────────────────────────────
+// College-year options shown in the login dropdown.
+const CLASS_YEARS = ['1st Year', '2nd Year', '3rd Year', '4th Year', '5th Year'] as const
+type ClassYear = typeof CLASS_YEARS[number]
+
+type Period = { id: string; label: string; start: string }
+
+// 8 periods of 45 minutes each, 9:30 -> 4:15, with a fixed recess
+// (12:30-1:15) that is not a selectable attendance slot.
+function buildPeriods(): Period[] {
+  const raw = [
+    ['09:30', '10:15'],
+    ['10:15', '11:00'],
+    ['11:00', '11:45'],
+    ['11:45', '12:30'],
+    // 12:30 - 1:15 recess (no period, no attendance slot)
+    ['13:15', '14:00'],
+    ['14:00', '14:45'],
+    ['14:45', '15:30'],
+    ['15:30', '16:15'],
+  ]
+  const to12h = (t: string) => {
+    const [h, m] = t.split(':').map(Number)
+    const period = h >= 12 ? 'PM' : 'AM'
+    const h12 = h % 12 === 0 ? 12 : h % 12
+    return `${h12}:${String(m).padStart(2, '0')} ${period}`
+  }
+  return raw.map(([start, end], i) => ({
+    id: `period-${i + 1}`,
+    label: `Period ${i + 1} · ${to12h(start)} – ${to12h(end)}`,
+    start,
+  }))
+}
+const PERIODS = buildPeriods()
+
+// Time-of-day greeting: before 12pm = morning, 12pm-5pm = afternoon, after 5pm = evening.
+function getTimeGreeting(): 'Good morning' | 'Good Afternoon' | 'Good Evening' {
+  const h = new Date().getHours()
+  if (h < 12) return 'Good morning'
+  if (h < 17) return 'Good Afternoon'
+  return 'Good Evening'
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function AvatarDot({ student, size = 40 }: { student: typeof STUDENTS[0]; size?: number }) {
   return (
@@ -242,9 +285,15 @@ function BottomNav({ active, onNav, dark }: { active: NavTab; onNav: (t: NavTab)
 }
 
 // ─── Screen: Login ────────────────────────────────────────────────────────────
-function LoginScreen({ onNext, dark }: { onNext: () => void; dark: boolean }) {
+type LoginDetails = { professorName: string; classYear: ClassYear; periodId: string }
+
+function LoginScreen({ onNext, dark }: { onNext: (details: LoginDetails) => void; dark: boolean }) {
   const [email, setEmail] = useState('ms.chen@lincoln.edu')
   const [pass, setPass] = useState('••••••••')
+  const [professorName, setProfessorName] = useState('')
+  const [classYear, setClassYear] = useState<ClassYear>(CLASS_YEARS[0])
+  const [periodId, setPeriodId] = useState(PERIODS[0].id)
+
   const inp = {
     width: '100%', padding: '13px 16px', borderRadius: 12,
     border: `1.5px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
@@ -252,10 +301,15 @@ function LoginScreen({ onNext, dark }: { onNext: () => void; dark: boolean }) {
     color: dark ? '#e2edf6' : '#1a2b3c', outline: 'none',
     fontFamily: 'Manrope, sans-serif', fontWeight: 500,
   }
+  const select = { ...inp, appearance: 'none' as const, cursor: 'pointer' }
+  const label = { fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.4, display: 'block', marginBottom: 6 }
+
+  const canContinue = professorName.trim().length > 0
+
   return (
     <div className="phone-scroll" style={{ flex: 1, padding: '32px 28px 24px', display: 'flex', flexDirection: 'column' }}>
       {/* Logo */}
-      <div style={{ marginBottom: 40 }}>
+      <div style={{ marginBottom: 32 }}>
         <div style={{
           width: 52, height: 52, borderRadius: 16,
           background: 'linear-gradient(135deg, #3d84a8, #5bb8a0)',
@@ -274,13 +328,13 @@ function LoginScreen({ onNext, dark }: { onNext: () => void; dark: boolean }) {
         </p>
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 24 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 20 }}>
         <div>
-          <label style={{ fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.4, display: 'block', marginBottom: 6 }}>EMAIL</label>
+          <label style={label}>EMAIL</label>
           <input style={inp} value={email} onChange={e => setEmail(e.target.value)} />
         </div>
         <div>
-          <label style={{ fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.4, display: 'block', marginBottom: 6 }}>PASSWORD</label>
+          <label style={label}>PASSWORD</label>
           <input style={inp} type="password" value={pass} onChange={e => setPass(e.target.value)} />
         </div>
         <div style={{ textAlign: 'right' }}>
@@ -288,12 +342,40 @@ function LoginScreen({ onNext, dark }: { onNext: () => void; dark: boolean }) {
         </div>
       </div>
 
-      <button onClick={onNext} style={{
-        width: '100%', padding: '15px', borderRadius: 14,
-        background: 'linear-gradient(135deg, #3d84a8, #5bb8a0)',
-        border: 'none', color: 'white', fontSize: 16, fontWeight: 700,
-        cursor: 'pointer', letterSpacing: 0.2,
-      }}>
+      {/* Class session details */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 24 }}>
+        <div>
+          <label style={label}>PROFESSOR NAME</label>
+          <input style={inp} value={professorName} onChange={e => setProfessorName(e.target.value)}
+            placeholder="e.g. Sumi Ghosh" />
+        </div>
+        <div>
+          <label style={label}>CLASS / YEAR</label>
+          <select style={select} value={classYear} onChange={e => setClassYear(e.target.value as ClassYear)}>
+            {CLASS_YEARS.map(y => <option key={y} value={y}>{y}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={label}>TIME SLOT</label>
+          <select style={select} value={periodId} onChange={e => setPeriodId(e.target.value)}>
+            {PERIODS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+          </select>
+          <p style={{ margin: '6px 0 0', fontSize: 11, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>
+            12:30 PM – 1:15 PM is recess — no attendance slot during that time.
+          </p>
+        </div>
+      </div>
+
+      <button
+        onClick={() => canContinue && onNext({ professorName: professorName.trim(), classYear, periodId })}
+        disabled={!canContinue}
+        style={{
+          width: '100%', padding: '15px', borderRadius: 14,
+          background: canContinue ? 'linear-gradient(135deg, #3d84a8, #5bb8a0)' : (dark ? '#2a4458' : '#d4e4ef'),
+          border: 'none', color: canContinue ? 'white' : (dark ? '#4a6880' : '#a0b8c8'),
+          fontSize: 16, fontWeight: 700,
+          cursor: canContinue ? 'pointer' : 'not-allowed', letterSpacing: 0.2,
+        }}>
         Continue
       </button>
 
@@ -391,7 +473,10 @@ function ConsentScreen({ onAccept, dark }: { onAccept: () => void; dark: boolean
 }
 
 // ─── Screen: Home Dashboard ───────────────────────────────────────────────────
-function HomeScreen({ onNav, onScreen, dark }: { onNav: (t: NavTab) => void; onScreen: (s: Screen) => void; dark: boolean }) {
+function HomeScreen({ onNav, onScreen, dark, professorName, classYear, periodLabel }: {
+  onNav: (t: NavTab) => void; onScreen: (s: Screen) => void; dark: boolean;
+  professorName: string; classYear: ClassYear; periodLabel: string
+}) {
   const bg = (h: string, tl: string) => `linear-gradient(135deg, ${h}, ${tl})`
   const quickActions = [
     { label: 'Register\nStudent', icon: icons.user, gradient: bg('#3d84a8', '#5ca8c8'), screen: 'registration' as Screen },
@@ -399,6 +484,12 @@ function HomeScreen({ onNav, onScreen, dark }: { onNav: (t: NavTab) => void; onS
     { label: 'Start Mood\nMonitor', icon: icons.smile, gradient: bg('#8fa8c8', '#7090b8'), screen: 'mood' as Screen },
     { label: 'View\nReports', icon: icons.chart, gradient: bg('#b8a0c8', '#9880b0'), screen: 'reports' as Screen },
   ]
+
+  const displayName = professorName || 'Professor'
+  const initials = professorName
+    ? professorName.split(' ').filter(Boolean).slice(0, 2).map(p => p[0].toUpperCase()).join('')
+    : 'P'
+
   return (
     <div className="phone-scroll" style={{ flex: 1, padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 20 }}>
       {/* Header */}
@@ -407,14 +498,16 @@ function HomeScreen({ onNav, onScreen, dark }: { onNav: (t: NavTab) => void; onS
           <p style={{ margin: 0, fontSize: 13, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 600 }}>
             {new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })}
           </p>
-          <h2 style={{ margin: '2px 0 0', fontSize: 22, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>Good morning, Ms Chen</h2>
+          <h2 style={{ margin: '2px 0 0', fontSize: 22, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>
+            {getTimeGreeting()}, Professor {displayName}
+          </h2>
         </div>
         <div style={{
           width: 40, height: 40, borderRadius: 20,
           background: 'linear-gradient(135deg, #3d84a8, #5bb8a0)',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           color: 'white', fontSize: 15, fontWeight: 800,
-        }}>SC</div>
+        }}>{initials}</div>
       </div>
 
       {/* Today's snapshot */}
@@ -424,7 +517,7 @@ function HomeScreen({ onNav, onScreen, dark }: { onNav: (t: NavTab) => void; onS
         border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
       }}>
         <div style={{ fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.5, marginBottom: 14 }}>
-          TODAY'S SNAPSHOT — Year 10 Science
+          TODAY'S SNAPSHOT — {classYear} · {periodLabel}
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
           {[
@@ -1571,27 +1664,6 @@ function ReportDetailScreen({ student, onBack, dark }: { student: typeof STUDENT
         </div>
       </div>
 
-      {/* ── Mood pie ── */}
-      <div style={card}>
-        <p style={sectionLabel}>MOOD BREAKDOWN</p>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-          <PieChart width={120} height={120}>
-            <Pie data={moodPie} cx={55} cy={55} innerRadius={30} outerRadius={52} dataKey="value" paddingAngle={2}>
-              {moodPie.map((d, i) => <Cell key={i} fill={d.fill} />)}
-            </Pie>
-          </PieChart>
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 5 }}>
-            {moodPie.map(d => (
-              <div key={d.name} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <div style={{ width: 8, height: 8, borderRadius: 4, background: d.fill, flexShrink: 0 }} />
-                <span style={{ fontSize: 10, color: dark ? '#e2edf6' : '#1a2b3c', fontWeight: 600, flex: 1 }}>{d.name}</span>
-                <span style={{ fontSize: 10, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 700 }}>{d.value}%</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-
       {/* ── Worth looking into ── */}
       <div style={{
         ...card,
@@ -1936,6 +2008,14 @@ export default function App() {
   const [navTab, setNavTab] = useState<NavTab>('home')
   const [selectedStudent, setSelectedStudent] = useState<typeof STUDENTS[0] | null>(null)
 
+  // Session/login details collected on the login screen — professor name,
+  // class year, and the selected class period. Currently kept in client
+  // state only (not yet persisted to the backend).
+  const [professorName, setProfessorName] = useState('')
+  const [classYear, setClassYear] = useState<ClassYear>(CLASS_YEARS[0])
+  const [periodId, setPeriodId] = useState(PERIODS[0].id)
+  const periodLabel = PERIODS.find(p => p.id === periodId)?.label ?? PERIODS[0].label
+
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark)
   }, [dark])
@@ -1948,15 +2028,25 @@ export default function App() {
     setScreen(map[tab])
   }
 
+  const handleLoginNext = (details: LoginDetails) => {
+    setProfessorName(details.professorName)
+    setClassYear(details.classYear)
+    setPeriodId(details.periodId)
+    setScreen('consent')
+  }
+
   const needsNav = ['home', 'students', 'mood', 'reports', 'report-detail', 'weekly-report', 'student-detail', 'settings'].includes(screen)
   const fullscreen = ['attendance', 'mood'].includes(screen)
 
   return (
     <PhoneFrame dark={dark}>
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        {screen === 'login' && <LoginScreen dark={dark} onNext={() => setScreen('consent')} />}
+        {screen === 'login' && <LoginScreen dark={dark} onNext={handleLoginNext} />}
         {screen === 'consent' && <ConsentScreen dark={dark} onAccept={() => { setScreen('home'); setNavTab('home') }} />}
-        {screen === 'home' && <HomeScreen dark={dark} onNav={handleNav} onScreen={s => setScreen(s)} />}
+        {screen === 'home' && (
+          <HomeScreen dark={dark} onNav={handleNav} onScreen={s => setScreen(s)}
+            professorName={professorName} classYear={classYear} periodLabel={periodLabel} />
+        )}
         {screen === 'registration' && <RegistrationScreen dark={dark} onBack={() => setScreen('home')} />}
         {screen === 'attendance' && <AttendanceScreen dark={dark} onBack={() => setScreen('home')} />}
         {screen === 'mood' && <MoodScreen dark={dark} onBack={() => { setScreen('home'); setNavTab('home') }} />}
