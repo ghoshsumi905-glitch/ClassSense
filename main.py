@@ -16,6 +16,19 @@ Run locally:
 Then your frontend calls http://localhost:8000/... during development,
 and your deployed backend URL (e.g. https://classsense-api.onrender.com)
 in production.
+
+CLASS / ROSTER / CONSENT UPDATE (this revision):
+Adds the narrow workflow's setup steps ahead of attendance:
+  POST /api/classes            -- teacher creates a class (professor+year+period)
+  POST /api/students/roster    -- teacher imports a roster of names into that class
+  GET  /api/students/roster    -- list a class's roster with consent + registration status
+  POST /api/students/{id}/consent -- record a student's consent choice
+Registration now requires consent_status == "biometric" before a face
+encoding is ever computed -- students who chose the non-biometric
+alternative, or haven't answered yet, can't accidentally get a face stored.
+Attendance sessions are now class-scoped end to end (start -> frame -> end),
+and uncertain matches accumulate into a per-session review queue that the
+teacher resolves via /api/attendance/review-correct.
 """
 import os
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
@@ -25,6 +38,7 @@ import numpy as np
 import cv2
 import pandas as pd
 import asyncio
+from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -68,7 +82,7 @@ attendance_system = AttendanceSystem(dataset_dir="registered_faces", attendance_
 from db import SQLALCHEMY_AVAILABLE
 if SQLALCHEMY_AVAILABLE:
     from db import engine, SessionLocal
-    from models import Base, EmotionEvent, Flag
+    from models import Base, EmotionEvent, Flag, SchoolClass, Student, LessonSegment, Intervention
     Base.metadata.create_all(bind=engine)
 
     def get_db():
@@ -157,7 +171,10 @@ _executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # In-memory session registries. Fine for a single-instance deployment;
 # if you ever scale to multiple server instances, move this to Redis.
-attendance_sessions = {}  # session_id -> {"marked": set(), "class_name": str}
+# attendance_sessions[session_id] now also carries:
+#   "class_id"       -- scopes recognition + roster lookups (see attendance_system.py)
+#   "uncertain_queue" -- list of {"name","confidence"} the teacher hasn't resolved yet
+attendance_sessions = {}
 mood_sessions = {}        # session_id -> {"monitor": ExtendedMoodClassroomMonitor, "frame_counter": int}
 
 
@@ -169,6 +186,165 @@ def _read_upload_as_bgr(file_bytes: bytes):
     return frame
 
 
+def _require_db():
+    if not SQLALCHEMY_AVAILABLE:
+        raise HTTPException(
+            status_code=501,
+            detail="Class/roster/consent features require the database (set DB_URL / install SQLAlchemy)."
+        )
+
+
+# ─── Classes ────────────────────────────────────────────────────────────────
+
+class CreateClassBody(BaseModel):
+    professor_name: str
+    class_year: str
+    period_id: Optional[str] = None
+    period_label: Optional[str] = None
+
+
+@app.post("/api/classes")
+def create_class(body: CreateClassBody):
+    """Step 1 of the workflow: teacher creates a class. Everything else
+    (roster, consent, face registrations, attendance, segments) hangs off
+    this class_id."""
+    _require_db()
+    db = SessionLocal()
+    try:
+        cls = SchoolClass(
+            professor_name=body.professor_name.strip(),
+            class_year=body.class_year,
+            period_id=body.period_id,
+            period_label=body.period_label,
+        )
+        db.add(cls)
+        db.commit()
+        db.refresh(cls)
+        return {
+            "class_id": cls.id,
+            "professor_name": cls.professor_name,
+            "class_year": cls.class_year,
+            "period_id": cls.period_id,
+            "period_label": cls.period_label,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/classes/{class_id}")
+def get_class(class_id: int):
+    _require_db()
+    db = SessionLocal()
+    try:
+        cls = db.query(SchoolClass).filter(SchoolClass.id == class_id).first()
+        if not cls:
+            raise HTTPException(status_code=404, detail="Class not found.")
+        return {
+            "class_id": cls.id,
+            "professor_name": cls.professor_name,
+            "class_year": cls.class_year,
+            "period_id": cls.period_id,
+            "period_label": cls.period_label,
+        }
+    finally:
+        db.close()
+
+
+# ─── Roster + consent ───────────────────────────────────────────────────────
+
+class RosterImportBody(BaseModel):
+    class_id: int
+    names: List[str]
+
+
+@app.post("/api/students/roster")
+def import_roster(body: RosterImportBody):
+    """Step 2: teacher imports a roster. Each name becomes a Student row
+    scoped to class_id with consent_status='pending' -- no face encoding
+    exists for anyone yet, matching the workflow's ordering (roster, THEN
+    consent, THEN recognition)."""
+    _require_db()
+    db = SessionLocal()
+    try:
+        cls = db.query(SchoolClass).filter(SchoolClass.id == body.class_id).first()
+        if not cls:
+            raise HTTPException(status_code=404, detail="Class not found.")
+
+        existing_names = {
+            s.name.lower() for s in db.query(Student).filter(Student.class_id == body.class_id).all()
+        }
+        created, skipped = [], []
+        for raw_name in body.names:
+            name = raw_name.strip()
+            if not name:
+                continue
+            if name.lower() in existing_names:
+                skipped.append(name)
+                continue
+            db.add(Student(class_id=body.class_id, name=name, consent_status="pending", face_registered=False))
+            existing_names.add(name.lower())
+            created.append(name)
+        db.commit()
+        return {"class_id": body.class_id, "created": created, "skipped_existing": skipped}
+    finally:
+        db.close()
+
+
+@app.get("/api/students/roster")
+def get_roster(class_id: int):
+    """Roster + consent + face-registration status for one class -- what
+    ReportsScreen/StudentsScreen should eventually read instead of the
+    hardcoded STUDENTS mock array."""
+    _require_db()
+    db = SessionLocal()
+    try:
+        students = (
+            db.query(Student)
+            .filter(Student.class_id == class_id)
+            .order_by(Student.name)
+            .all()
+        )
+        return {
+            "class_id": class_id,
+            "students": [
+                {
+                    "id": s.id,
+                    "name": s.name,
+                    "consent_status": s.consent_status,
+                    "face_registered": s.face_registered,
+                }
+                for s in students
+            ],
+        }
+    finally:
+        db.close()
+
+
+class ConsentBody(BaseModel):
+    consent_status: str  # 'biometric' | 'non_biometric' | 'pending'
+
+
+@app.post("/api/students/{student_id}/consent")
+def set_consent(student_id: int, body: ConsentBody):
+    """Step 3: student gives consent or opts into the non-biometric
+    alternative. Recorded per-student so registration (below) can enforce
+    it -- a student who is 'non_biometric' or still 'pending' should never
+    have a face encoding computed for them."""
+    if body.consent_status not in ("biometric", "non_biometric", "pending"):
+        raise HTTPException(status_code=400, detail="consent_status must be 'biometric', 'non_biometric', or 'pending'.")
+    _require_db()
+    db = SessionLocal()
+    try:
+        student = db.query(Student).filter(Student.id == student_id).first()
+        if not student:
+            raise HTTPException(status_code=404, detail="Student not found.")
+        student.consent_status = body.consent_status
+        db.commit()
+        return {"id": student.id, "name": student.name, "consent_status": student.consent_status}
+    finally:
+        db.close()
+
+
 # ─── Students / Registration ───────────────────────────────────────────────
 
 @app.get("/api/students")
@@ -178,11 +354,37 @@ def list_students():
 
 
 @app.post("/api/students/register")
-async def register_student(name: str = Form(...), images: list[UploadFile] = File(...)):
+async def register_student(
+    name: str = Form(...),
+    images: List[UploadFile] = File(...),
+    class_id: Optional[int] = Form(None),
+    student_id: Optional[int] = Form(None),
+):
     """Accepts the multiple angle-shots captured in the browser's
     RegistrationScreen and saves them exactly like the old space-bar
     capture loop did -- just sourced from the browser instead of a local
-    cv2 window."""
+    cv2 window. Now class-scoped: the same name under two different
+    class_ids is two separate identities (see attendance_system.py).
+
+    If student_id is provided, this enforces biometric consent BEFORE
+    computing any face encoding, and flips that student's
+    face_registered flag to True afterwards."""
+    student = None
+    if SQLALCHEMY_AVAILABLE and student_id is not None:
+        db = SessionLocal()
+        try:
+            student = db.query(Student).filter(Student.id == student_id).first()
+            if not student:
+                raise HTTPException(status_code=404, detail="Student not found.")
+            if student.consent_status != "biometric":
+                raise HTTPException(
+                    status_code=403,
+                    detail="This student hasn't given biometric consent -- use the non-biometric attendance option instead."
+                )
+            class_id = student.class_id
+        finally:
+            db.close()
+
     frames = []
     for img in images:
         content = await img.read()
@@ -191,8 +393,19 @@ async def register_student(name: str = Form(...), images: list[UploadFile] = Fil
     if not frames:
         raise HTTPException(status_code=400, detail="No images received.")
 
-    saved = attendance_system.register_face_images(name, frames)
-    return {"name": name, "images_saved": saved, "status": "registered"}
+    saved = attendance_system.register_face_images(name, frames, class_id=class_id)
+
+    if SQLALCHEMY_AVAILABLE and student_id is not None:
+        db = SessionLocal()
+        try:
+            student = db.query(Student).filter(Student.id == student_id).first()
+            if student:
+                student.face_registered = True
+                db.commit()
+        finally:
+            db.close()
+
+    return {"name": name, "images_saved": saved, "status": "registered", "class_id": class_id}
 
 
 # ─── Attendance sessions ────────────────────────────────────────────────────
@@ -202,14 +415,24 @@ class StartSessionResponse(BaseModel):
 
 
 @app.post("/api/attendance/start", response_model=StartSessionResponse)
-def start_attendance_session(class_name: str = Form("")):
+def start_attendance_session(class_name: str = Form(""), class_id: Optional[int] = Form(None)):
+    """Step 4: teacher starts attendance. class_id scopes recognition to
+    this class's registered faces (attendance_system.recognize_faces)."""
     session_id = str(uuid.uuid4())
-    attendance_sessions[session_id] = {"marked": set(), "class_name": class_name}
+    attendance_sessions[session_id] = {
+        "marked": set(),
+        "class_name": class_name,
+        "class_id": class_id,
+        "uncertain_queue": [],  # step 6: review queue for uncertain/unknown matches
+    }
     return {"session_id": session_id}
 
 
 @app.post("/api/attendance/frame")
 async def attendance_frame(session_id: str = Form(...), image: UploadFile = File(...)):
+    """Steps 5-6: recognize students with confidence scores; matched faces
+    are auto-marked present, uncertain faces accumulate into this
+    session's review queue instead of being silently marked or dropped."""
     if session_id not in attendance_sessions:
         raise HTTPException(status_code=404, detail="Unknown session_id. Call /api/attendance/start first.")
     frame = _read_upload_as_bgr(await image.read())
@@ -219,17 +442,68 @@ async def attendance_frame(session_id: str = Form(...), image: UploadFile = File
     # blocking; running it inline on the event loop freezes every other
     # request on the server while it runs.
     result = await loop.run_in_executor(
-        _executor, attendance_system.process_attendance_frame, frame, session["marked"], session_id
+        _executor,
+        attendance_system.process_attendance_frame,
+        frame, session["marked"], session_id, session.get("class_id"),
     )
+
+    # Accumulate newly-seen uncertain matches into the review queue, deduped
+    # by name so a face lingering across several frames doesn't spam entries.
+    existing_names = {u["name"] for u in session["uncertain_queue"]}
+    for u in result.get("uncertain", []):
+        if u["name"] and u["name"] not in existing_names:
+            session["uncertain_queue"].append(u)
+            existing_names.add(u["name"])
+
+    result["uncertain_queue"] = session["uncertain_queue"]
     return result
+
+
+@app.get("/api/attendance/review-queue")
+def get_review_queue(session_id: str):
+    """Standalone poll for the review queue, in case the frontend wants to
+    render it in a dedicated sheet/screen rather than reading it off every
+    frame response."""
+    if session_id not in attendance_sessions:
+        raise HTTPException(status_code=404, detail="Unknown session_id.")
+    return {"uncertain": attendance_sessions[session_id]["uncertain_queue"]}
+
+
+class ReviewCorrectionBody(BaseModel):
+    session_id: str
+    original_name: str            # the queue entry's best-guess name being resolved
+    corrected_name: Optional[str] = None  # confirmed/corrected name; omit/None to dismiss (not present)
+
+
+@app.post("/api/attendance/review-correct")
+def correct_review_match(body: ReviewCorrectionBody):
+    """Step 7: teacher corrects mistakes. Removes the entry from the review
+    queue; if a corrected_name is given, marks that student Present exactly
+    like an auto-match would (writes the same attendance.csv row type)."""
+    if body.session_id not in attendance_sessions:
+        raise HTTPException(status_code=404, detail="Unknown session_id.")
+    session = attendance_sessions[body.session_id]
+    session["uncertain_queue"] = [
+        u for u in session["uncertain_queue"] if u["name"] != body.original_name
+    ]
+    if body.corrected_name and body.corrected_name not in session["marked"]:
+        attendance_system._append_attendance_row(body.corrected_name, "Present", body.session_id)
+        session["marked"].add(body.corrected_name)
+    return {"marked": sorted(session["marked"]), "uncertain": session["uncertain_queue"]}
 
 
 @app.post("/api/attendance/end")
 def end_attendance_session(session_id: str = Form(...)):
+    """Step 8 (pre-sync): finalize present/absent for the class roster.
+    Actual sync to the school's existing SIS/attendance system is a
+    separate integration step -- see the TODO where finalize_session
+    returns, once you tell me which system/format it needs to match."""
     if session_id not in attendance_sessions:
         raise HTTPException(status_code=404, detail="Unknown session_id.")
     session = attendance_sessions.pop(session_id)
-    summary = attendance_system.finalize_session(session["marked"], session_id)
+    summary = attendance_system.finalize_session(
+        session["marked"], session_id, class_id=session.get("class_id")
+    )
     return summary
 
 
