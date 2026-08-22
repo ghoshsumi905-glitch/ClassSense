@@ -17,28 +17,39 @@ Then your frontend calls http://localhost:8000/... during development,
 and your deployed backend URL (e.g. https://classsense-api.onrender.com)
 in production.
 
-CLASS / ROSTER / CONSENT UPDATE (this revision):
-Adds the narrow workflow's setup steps ahead of attendance:
-  POST /api/classes            -- teacher creates a class (professor+year+period)
-  POST /api/students/roster    -- teacher imports a roster of names into that class
-  GET  /api/students/roster    -- list a class's roster with consent + registration status
-  POST /api/students/{id}/consent -- record a student's consent choice
-Registration now requires consent_status == "biometric" before a face
-encoding is ever computed -- students who chose the non-biometric
-alternative, or haven't answered yet, can't accidentally get a face stored.
-Attendance sessions are now class-scoped end to end (start -> frame -> end),
-and uncertain matches accumulate into a per-session review queue that the
-teacher resolves via /api/attendance/review-correct.
+CHANGELOG (this revision):
+  - Classes & roster: SchoolClass/Student now live in the DB (models.py).
+    A class is created at login (professor + year + period), a roster is
+    bulk-imported under it, and each Student's consent_status and
+    face_registered flag are tracked per class -- this is what the
+    Students page should read going forward instead of deriving names
+    from cognitive_load_log.csv, since a student now exists independently
+    of whether they've had a monitored session yet.
+  - Lesson segments: a teacher can mark "we're in lecture / group_work /
+    quiz / discussion" mid-session. /api/mood/frame now looks up whichever
+    segment is currently open for that session_id and stamps it onto each
+    EmotionEvent row as it's written, so segment-level engagement falls
+    out of data already being logged.
+  - Interventions: a teacher can record a note against a class/session/
+    segment, and /api/classes/{id}/interventions/effectiveness compares
+    that segment's engagement in the session right before vs. right after
+    -- an honest average-delta comparison, not a trained model.
+
+STILL BLOCKED: recognition confidence scores + review queue + manual
+correction (the "uncertain match" workflow) depend entirely on
+attendance_system.py's recognition internals, which haven't been shared
+yet. Nothing here should be read as that being done -- it isn't started.
 """
 import os
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 import uuid
+import statistics
+from typing import Optional, List
 import numpy as np
 import cv2
 import pandas as pd
 import asyncio
-from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -171,11 +182,11 @@ _executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # In-memory session registries. Fine for a single-instance deployment;
 # if you ever scale to multiple server instances, move this to Redis.
-# attendance_sessions[session_id] now also carries:
-#   "class_id"       -- scopes recognition + roster lookups (see attendance_system.py)
-#   "uncertain_queue" -- list of {"name","confidence"} the teacher hasn't resolved yet
-attendance_sessions = {}
-mood_sessions = {}        # session_id -> {"monitor": ExtendedMoodClassroomMonitor, "frame_counter": int}
+attendance_sessions = {}  # session_id -> {"marked": set(), "class_name": str}
+# mood_sessions now also carries an optional "class_id" so /api/mood/frame
+# can stamp EmotionEvent rows with the class they belong to -- needed for
+# per-class/per-segment engagement aggregation below.
+mood_sessions = {}        # session_id -> {"monitor": ..., "frame_counter": int, "class_id": int|None}
 
 
 def _read_upload_as_bgr(file_bytes: bytes):
@@ -190,157 +201,134 @@ def _require_db():
     if not SQLALCHEMY_AVAILABLE:
         raise HTTPException(
             status_code=501,
-            detail="Class/roster/consent features require the database (set DB_URL / install SQLAlchemy)."
+            detail="This feature requires SQLAlchemy + DB_URL to be configured (see db.py)."
         )
 
 
-# ─── Classes ────────────────────────────────────────────────────────────────
-
-class CreateClassBody(BaseModel):
-    professor_name: str
-    class_year: str
-    period_id: Optional[str] = None
-    period_label: Optional[str] = None
-
+# ─── Classes & Roster ───────────────────────────────────────────────────────
 
 @app.post("/api/classes")
-def create_class(body: CreateClassBody):
-    """Step 1 of the workflow: teacher creates a class. Everything else
-    (roster, consent, face registrations, attendance, segments) hangs off
-    this class_id."""
+def create_class(professor_name: str = Form(...), class_year: str = Form(...),
+                  period_id: str = Form(""), period_label: str = Form("")):
+    """Creates a class/session record: professor + year + period. Every
+    roster, student, segment, and intervention below is scoped to this id,
+    so 'Amara Diallo' in 1st Year and 'Amara Diallo' in 3rd Year are two
+    separate Student rows and never collide."""
     _require_db()
     db = SessionLocal()
     try:
         cls = SchoolClass(
-            professor_name=body.professor_name.strip(),
-            class_year=body.class_year,
-            period_id=body.period_id,
-            period_label=body.period_label,
+            professor_name=professor_name, class_year=class_year,
+            period_id=period_id or None, period_label=period_label or None,
         )
         db.add(cls)
         db.commit()
         db.refresh(cls)
         return {
-            "class_id": cls.id,
-            "professor_name": cls.professor_name,
-            "class_year": cls.class_year,
-            "period_id": cls.period_id,
-            "period_label": cls.period_label,
+            "id": cls.id, "professor_name": cls.professor_name, "class_year": cls.class_year,
+            "period_id": cls.period_id, "period_label": cls.period_label,
         }
     finally:
         db.close()
 
 
-@app.get("/api/classes/{class_id}")
-def get_class(class_id: int):
+@app.get("/api/classes")
+def list_classes(class_year: Optional[str] = None):
+    if not SQLALCHEMY_AVAILABLE:
+        return {"classes": []}
+    db = SessionLocal()
+    try:
+        q = db.query(SchoolClass)
+        if class_year:
+            q = q.filter(SchoolClass.class_year == class_year)
+        rows = q.order_by(SchoolClass.created_at.desc()).all()
+        return {"classes": [
+            {
+                "id": c.id, "professor_name": c.professor_name, "class_year": c.class_year,
+                "period_id": c.period_id, "period_label": c.period_label,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            }
+            for c in rows
+        ]}
+    finally:
+        db.close()
+
+
+class RosterImportPayload(BaseModel):
+    names: List[str]
+
+
+@app.post("/api/classes/{class_id}/roster")
+def import_roster(class_id: int, payload: RosterImportPayload):
+    """Bulk-imports a roster: one Student row per name, consent_status
+    'pending' until set via /api/students/{id}/consent, face_registered
+    False until register_face_images() succeeds for them under this
+    class_id. Names already on the roster are skipped, not duplicated,
+    so re-importing an updated CSV is safe."""
     _require_db()
     db = SessionLocal()
     try:
         cls = db.query(SchoolClass).filter(SchoolClass.id == class_id).first()
         if not cls:
             raise HTTPException(status_code=404, detail="Class not found.")
-        return {
-            "class_id": cls.id,
-            "professor_name": cls.professor_name,
-            "class_year": cls.class_year,
-            "period_id": cls.period_id,
-            "period_label": cls.period_label,
-        }
-    finally:
-        db.close()
-
-
-# ─── Roster + consent ───────────────────────────────────────────────────────
-
-class RosterImportBody(BaseModel):
-    class_id: int
-    names: List[str]
-
-
-@app.post("/api/students/roster")
-def import_roster(body: RosterImportBody):
-    """Step 2: teacher imports a roster. Each name becomes a Student row
-    scoped to class_id with consent_status='pending' -- no face encoding
-    exists for anyone yet, matching the workflow's ordering (roster, THEN
-    consent, THEN recognition)."""
-    _require_db()
-    db = SessionLocal()
-    try:
-        cls = db.query(SchoolClass).filter(SchoolClass.id == body.class_id).first()
-        if not cls:
-            raise HTTPException(status_code=404, detail="Class not found.")
-
-        existing_names = {
-            s.name.lower() for s in db.query(Student).filter(Student.class_id == body.class_id).all()
-        }
-        created, skipped = [], []
-        for raw_name in body.names:
+        created = []
+        for raw_name in payload.names:
             name = raw_name.strip()
             if not name:
                 continue
-            if name.lower() in existing_names:
-                skipped.append(name)
+            existing = db.query(Student).filter(Student.class_id == class_id, Student.name == name).first()
+            if existing:
                 continue
-            db.add(Student(class_id=body.class_id, name=name, consent_status="pending", face_registered=False))
-            existing_names.add(name.lower())
+            db.add(Student(class_id=class_id, name=name, consent_status="pending", face_registered=False))
             created.append(name)
         db.commit()
-        return {"class_id": body.class_id, "created": created, "skipped_existing": skipped}
+        return {"class_id": class_id, "imported": created, "skipped_existing": len(payload.names) - len(created)}
     finally:
         db.close()
 
 
-@app.get("/api/students/roster")
-def get_roster(class_id: int):
-    """Roster + consent + face-registration status for one class -- what
-    ReportsScreen/StudentsScreen should eventually read instead of the
-    hardcoded STUDENTS mock array."""
-    _require_db()
+@app.get("/api/classes/{class_id}/students")
+def list_class_students(class_id: int):
+    """Persistent, per-class-year student directory. This is the
+    replacement for deriving the Students page from cognitive_load_log.csv
+    -- a student now exists here as soon as they're on a roster, whether
+    or not they've had a monitored session yet, and 'Amara Diallo' in one
+    class_year is a distinct row from 'Amara Diallo' in another."""
+    if not SQLALCHEMY_AVAILABLE:
+        return {"students": []}
     db = SessionLocal()
     try:
-        students = (
-            db.query(Student)
-            .filter(Student.class_id == class_id)
-            .order_by(Student.name)
-            .all()
-        )
-        return {
-            "class_id": class_id,
-            "students": [
-                {
-                    "id": s.id,
-                    "name": s.name,
-                    "consent_status": s.consent_status,
-                    "face_registered": s.face_registered,
-                }
-                for s in students
-            ],
-        }
+        rows = db.query(Student).filter(Student.class_id == class_id).order_by(Student.name.asc()).all()
+        return {"students": [
+            {"id": s.id, "name": s.name, "consent_status": s.consent_status, "face_registered": s.face_registered}
+            for s in rows
+        ]}
     finally:
         db.close()
 
 
-class ConsentBody(BaseModel):
-    consent_status: str  # 'biometric' | 'non_biometric' | 'pending'
+class ConsentPayload(BaseModel):
+    status: str  # 'biometric' | 'non_biometric' | 'pending'
 
 
 @app.post("/api/students/{student_id}/consent")
-def set_consent(student_id: int, body: ConsentBody):
-    """Step 3: student gives consent or opts into the non-biometric
-    alternative. Recorded per-student so registration (below) can enforce
-    it -- a student who is 'non_biometric' or still 'pending' should never
-    have a face encoding computed for them."""
-    if body.consent_status not in ("biometric", "non_biometric", "pending"):
-        raise HTTPException(status_code=400, detail="consent_status must be 'biometric', 'non_biometric', or 'pending'.")
+def set_student_consent(student_id: int, payload: ConsentPayload):
+    """Records whether a student (or their guardian) has consented to
+    biometric face recognition, or opted into the non-biometric
+    alternative (e.g. manual roll call for that student). This is a
+    per-student flag, not all-or-nothing for the class -- a class can mix
+    biometric and non-biometric students."""
+    if payload.status not in ("biometric", "non_biometric", "pending"):
+        raise HTTPException(status_code=400, detail="status must be 'biometric', 'non_biometric', or 'pending'.")
     _require_db()
     db = SessionLocal()
     try:
-        student = db.query(Student).filter(Student.id == student_id).first()
-        if not student:
+        s = db.query(Student).filter(Student.id == student_id).first()
+        if not s:
             raise HTTPException(status_code=404, detail="Student not found.")
-        student.consent_status = body.consent_status
+        s.consent_status = payload.status
         db.commit()
-        return {"id": student.id, "name": student.name, "consent_status": student.consent_status}
+        return {"id": s.id, "name": s.name, "consent_status": s.consent_status}
     finally:
         db.close()
 
@@ -349,42 +337,28 @@ def set_consent(student_id: int, body: ConsentBody):
 
 @app.get("/api/students")
 def list_students():
+    """Legacy, class-unscoped list from AttendanceSystem's in-memory
+    encodings. Prefer /api/classes/{class_id}/students for anything
+    year-scoped -- this endpoint is kept for backward compatibility only."""
     names = sorted(set(attendance_system.known_face_names))
     return {"students": names, "total_face_samples": len(attendance_system.known_face_names)}
 
 
 @app.post("/api/students/register")
-async def register_student(
-    name: str = Form(...),
-    images: List[UploadFile] = File(...),
-    class_id: Optional[int] = Form(None),
-    student_id: Optional[int] = Form(None),
-):
+async def register_student(name: str = Form(...), images: List[UploadFile] = File(...),
+                            class_id: Optional[int] = Form(None)):
     """Accepts the multiple angle-shots captured in the browser's
     RegistrationScreen and saves them exactly like the old space-bar
     capture loop did -- just sourced from the browser instead of a local
-    cv2 window. Now class-scoped: the same name under two different
-    class_ids is two separate identities (see attendance_system.py).
+    cv2 window.
 
-    If student_id is provided, this enforces biometric consent BEFORE
-    computing any face encoding, and flips that student's
-    face_registered flag to True afterwards."""
-    student = None
-    if SQLALCHEMY_AVAILABLE and student_id is not None:
-        db = SessionLocal()
-        try:
-            student = db.query(Student).filter(Student.id == student_id).first()
-            if not student:
-                raise HTTPException(status_code=404, detail="Student not found.")
-            if student.consent_status != "biometric":
-                raise HTTPException(
-                    status_code=403,
-                    detail="This student hasn't given biometric consent -- use the non-biometric attendance option instead."
-                )
-            class_id = student.class_id
-        finally:
-            db.close()
-
+    If class_id is given and the DB is configured, this also flips the
+    matching roster Student's face_registered flag to True (creating the
+    roster row if it doesn't exist yet, e.g. registering someone ahead of
+    a roster import). Face encodings themselves still live in
+    AttendanceSystem -- this only updates the class-scoped directory
+    flag, since AttendanceSystem's storage format wasn't shared and
+    shouldn't be guessed at."""
     frames = []
     for img in images:
         content = await img.read()
@@ -395,17 +369,19 @@ async def register_student(
 
     saved = attendance_system.register_face_images(name, frames, class_id=class_id)
 
-    if SQLALCHEMY_AVAILABLE and student_id is not None:
+    if class_id is not None and SQLALCHEMY_AVAILABLE and saved:
         db = SessionLocal()
         try:
-            student = db.query(Student).filter(Student.id == student_id).first()
-            if student:
-                student.face_registered = True
-                db.commit()
+            s = db.query(Student).filter(Student.class_id == class_id, Student.name == name).first()
+            if not s:
+                s = Student(class_id=class_id, name=name, consent_status="pending", face_registered=False)
+                db.add(s)
+            s.face_registered = True
+            db.commit()
         finally:
             db.close()
 
-    return {"name": name, "images_saved": saved, "status": "registered", "class_id": class_id}
+    return {"name": name, "images_saved": saved, "status": "registered"}
 
 
 # ─── Attendance sessions ────────────────────────────────────────────────────
@@ -415,24 +391,14 @@ class StartSessionResponse(BaseModel):
 
 
 @app.post("/api/attendance/start", response_model=StartSessionResponse)
-def start_attendance_session(class_name: str = Form(""), class_id: Optional[int] = Form(None)):
-    """Step 4: teacher starts attendance. class_id scopes recognition to
-    this class's registered faces (attendance_system.recognize_faces)."""
+def start_attendance_session(class_name: str = Form("")):
     session_id = str(uuid.uuid4())
-    attendance_sessions[session_id] = {
-        "marked": set(),
-        "class_name": class_name,
-        "class_id": class_id,
-        "uncertain_queue": [],  # step 6: review queue for uncertain/unknown matches
-    }
+    attendance_sessions[session_id] = {"marked": set(), "class_name": class_name}
     return {"session_id": session_id}
 
 
 @app.post("/api/attendance/frame")
 async def attendance_frame(session_id: str = Form(...), image: UploadFile = File(...)):
-    """Steps 5-6: recognize students with confidence scores; matched faces
-    are auto-marked present, uncertain faces accumulate into this
-    session's review queue instead of being silently marked or dropped."""
     if session_id not in attendance_sessions:
         raise HTTPException(status_code=404, detail="Unknown session_id. Call /api/attendance/start first.")
     frame = _read_upload_as_bgr(await image.read())
@@ -442,78 +408,27 @@ async def attendance_frame(session_id: str = Form(...), image: UploadFile = File
     # blocking; running it inline on the event loop freezes every other
     # request on the server while it runs.
     result = await loop.run_in_executor(
-        _executor,
-        attendance_system.process_attendance_frame,
-        frame, session["marked"], session_id, session.get("class_id"),
+        _executor, attendance_system.process_attendance_frame, frame, session["marked"], session_id
     )
-
-    # Accumulate newly-seen uncertain matches into the review queue, deduped
-    # by name so a face lingering across several frames doesn't spam entries.
-    existing_names = {u["name"] for u in session["uncertain_queue"]}
-    for u in result.get("uncertain", []):
-        if u["name"] and u["name"] not in existing_names:
-            session["uncertain_queue"].append(u)
-            existing_names.add(u["name"])
-
-    result["uncertain_queue"] = session["uncertain_queue"]
     return result
-
-
-@app.get("/api/attendance/review-queue")
-def get_review_queue(session_id: str):
-    """Standalone poll for the review queue, in case the frontend wants to
-    render it in a dedicated sheet/screen rather than reading it off every
-    frame response."""
-    if session_id not in attendance_sessions:
-        raise HTTPException(status_code=404, detail="Unknown session_id.")
-    return {"uncertain": attendance_sessions[session_id]["uncertain_queue"]}
-
-
-class ReviewCorrectionBody(BaseModel):
-    session_id: str
-    original_name: str            # the queue entry's best-guess name being resolved
-    corrected_name: Optional[str] = None  # confirmed/corrected name; omit/None to dismiss (not present)
-
-
-@app.post("/api/attendance/review-correct")
-def correct_review_match(body: ReviewCorrectionBody):
-    """Step 7: teacher corrects mistakes. Removes the entry from the review
-    queue; if a corrected_name is given, marks that student Present exactly
-    like an auto-match would (writes the same attendance.csv row type)."""
-    if body.session_id not in attendance_sessions:
-        raise HTTPException(status_code=404, detail="Unknown session_id.")
-    session = attendance_sessions[body.session_id]
-    session["uncertain_queue"] = [
-        u for u in session["uncertain_queue"] if u["name"] != body.original_name
-    ]
-    if body.corrected_name and body.corrected_name not in session["marked"]:
-        attendance_system._append_attendance_row(body.corrected_name, "Present", body.session_id)
-        session["marked"].add(body.corrected_name)
-    return {"marked": sorted(session["marked"]), "uncertain": session["uncertain_queue"]}
 
 
 @app.post("/api/attendance/end")
 def end_attendance_session(session_id: str = Form(...)):
-    """Step 8 (pre-sync): finalize present/absent for the class roster.
-    Actual sync to the school's existing SIS/attendance system is a
-    separate integration step -- see the TODO where finalize_session
-    returns, once you tell me which system/format it needs to match."""
     if session_id not in attendance_sessions:
         raise HTTPException(status_code=404, detail="Unknown session_id.")
     session = attendance_sessions.pop(session_id)
-    summary = attendance_system.finalize_session(
-        session["marked"], session_id, class_id=session.get("class_id")
-    )
+    summary = attendance_system.finalize_session(session["marked"], session_id)
     return summary
 
 
 # ─── Mood / attentiveness sessions ─────────────────────────────────────────
 
 @app.post("/api/mood/start", response_model=StartSessionResponse)
-def start_mood_session():
+def start_mood_session(class_id: Optional[int] = Form(None)):
     session_id = str(uuid.uuid4())
     monitor = ExtendedMoodClassroomMonitor(attendance_system, log_file="cognitive_load_log.csv")
-    mood_sessions[session_id] = {"monitor": monitor, "frame_counter": 0}
+    mood_sessions[session_id] = {"monitor": monitor, "frame_counter": 0, "class_id": class_id}
     return {"session_id": session_id}
 
 
@@ -682,22 +597,34 @@ async def mood_flags(since_days: int = 7, sadness_threshold: float = 0.55, requi
     return {"flags": results}
 
 
+def _open_segment_type(db, session_id):
+    """Looks up whichever LessonSegment is currently open (end_ts is null)
+    for this session_id, if any. Used to stamp each EmotionEvent row with
+    the segment that was active when it was logged."""
+    seg = (db.query(LessonSegment)
+           .filter(LessonSegment.session_id == session_id, LessonSegment.end_ts.is_(None))
+           .first())
+    return seg.segment_type if seg else None
+
+
 @app.post("/api/mood/frame")
 async def mood_frame(session_id: str = Form(...), image: UploadFile = File(...)):
     if session_id not in mood_sessions:
         raise HTTPException(status_code=404, detail="Unknown session_id. Call /api/mood/start first.")
     frame = _read_upload_as_bgr(await image.read())
     state = mood_sessions[session_id]
+    class_id = state.get("class_id")
     loop = asyncio.get_running_loop()
     results = await loop.run_in_executor(_executor, state["monitor"].process_frame, frame, state["frame_counter"], session_id)
     state["frame_counter"] += 1
 
     try:
-        def _log_faces(faces, session_id):
+        def _log_faces(faces, session_id, class_id):
             try:
                 if SQLALCHEMY_AVAILABLE:
                     db = SessionLocal()
                     try:
+                        segment_type = _open_segment_type(db, session_id)
                         for f in faces:
                             ep = f.get("emotion_probs") or {}
                             if not ep:
@@ -706,6 +633,8 @@ async def mood_frame(session_id: str = Form(...), image: UploadFile = File(...))
                                 user_id=None,
                                 recognized_name=f.get("name"),
                                 session_id=session_id,
+                                class_id=class_id,
+                                segment_type=segment_type,
                                 emotion_probs=json.dumps(ep),
                                 source='mood_frame',
                                 meta=json.dumps({"box": f.get("box")})
@@ -724,7 +653,7 @@ async def mood_frame(session_id: str = Form(...), image: UploadFile = File(...))
                         _sqlite_insert_event(None, f.get("name"), session_id, datetime.utcnow().isoformat(), json.dumps(ep), 'mood_frame', json.dumps({"box": f.get("box")}))
             except Exception:
                 pass
-        _executor.submit(_log_faces, results, session_id)
+        _executor.submit(_log_faces, results, session_id, class_id)
     except Exception:
         pass
 
@@ -737,6 +666,252 @@ def end_mood_session(session_id: str = Form(...)):
         raise HTTPException(status_code=404, detail="Unknown session_id.")
     mood_sessions.pop(session_id)
     return {"status": "ended", "session_id": session_id}
+
+
+# ─── Lesson segments ────────────────────────────────────────────────────────
+
+class SegmentStartPayload(BaseModel):
+    session_id: str
+    segment_type: str  # 'lecture' | 'group_work' | 'quiz' | 'discussion'
+    class_id: Optional[int] = None
+
+
+SEGMENT_TYPES = ("lecture", "group_work", "quiz", "discussion")
+
+
+@app.post("/api/segments/start")
+def start_segment(payload: SegmentStartPayload):
+    """Marks the start of a lesson segment. Any previously open segment for
+    this session_id is closed first -- a session only has one active
+    segment at a time, matching a teacher tapping 'now we're in group
+    work' mid-class."""
+    if payload.segment_type not in SEGMENT_TYPES:
+        raise HTTPException(status_code=400, detail=f"segment_type must be one of: {', '.join(SEGMENT_TYPES)}.")
+    _require_db()
+    db = SessionLocal()
+    try:
+        open_seg = (db.query(LessonSegment)
+                    .filter(LessonSegment.session_id == payload.session_id, LessonSegment.end_ts.is_(None))
+                    .first())
+        if open_seg:
+            open_seg.end_ts = datetime.utcnow()
+        seg = LessonSegment(session_id=payload.session_id, class_id=payload.class_id, segment_type=payload.segment_type)
+        db.add(seg)
+        db.commit()
+        db.refresh(seg)
+        return {
+            "id": seg.id, "session_id": seg.session_id, "segment_type": seg.segment_type,
+            "start_ts": seg.start_ts.isoformat() if seg.start_ts else None,
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/segments/end")
+def end_current_segment(session_id: str = Form(...)):
+    """Closes whichever segment is currently open for this session, without
+    starting a new one -- e.g. the teacher stops tagging for the rest of
+    the class."""
+    _require_db()
+    db = SessionLocal()
+    try:
+        open_seg = (db.query(LessonSegment)
+                    .filter(LessonSegment.session_id == session_id, LessonSegment.end_ts.is_(None))
+                    .first())
+        if not open_seg:
+            return {"status": "no_open_segment"}
+        open_seg.end_ts = datetime.utcnow()
+        db.commit()
+        return {"status": "ended", "segment_id": open_seg.id}
+    finally:
+        db.close()
+
+
+def _engagement_proxy(emotion_probs: dict) -> float:
+    """A rough positive-engagement proxy from stored FERPlus-style emotion
+    probabilities: 'happy' fully, 'neutral' half-weighted, everything else
+    (sad/angry/fear/etc.) contributes nothing. This is deliberately coarser
+    than mood_detection.py's cognitive_load score, since EmotionEvent rows
+    only store raw emotion_probs, not the full attentiveness/PERCLOS state
+    that feeds cognitive_load -- good enough to compare segments against
+    each other, not meant to replace the real per-session engagement
+    numbers in /api/reports/summary and /api/reports/weekly."""
+    return emotion_probs.get("happy", 0.0) + emotion_probs.get("neutral", 0.0) * 0.5
+
+
+@app.get("/api/sessions/{session_id}/segments/engagement")
+def segment_engagement(session_id: str):
+    """Engagement broken out by lesson segment for one session -- answers
+    'did engagement drop during the lecture portion vs. group work'."""
+    if not SQLALCHEMY_AVAILABLE:
+        return {"available": False}
+    db = SessionLocal()
+    try:
+        segments = (db.query(LessonSegment)
+                    .filter(LessonSegment.session_id == session_id)
+                    .order_by(LessonSegment.start_ts.asc())
+                    .all())
+        if not segments:
+            return {"available": False}
+
+        events = (db.query(EmotionEvent.segment_type, EmotionEvent.emotion_probs)
+                  .filter(EmotionEvent.session_id == session_id, EmotionEvent.segment_type.isnot(None))
+                  .all())
+
+        by_segment = defaultdict(list)
+        for seg_type, ep_json in events:
+            try:
+                ep = json.loads(ep_json)
+            except Exception:
+                continue
+            by_segment[seg_type].append(_engagement_proxy(ep))
+
+        results = []
+        lowest = None
+        for seg in segments:
+            vals = by_segment.get(seg.segment_type, [])
+            avg = round(statistics.mean(vals), 1) if vals else None
+            duration_min = round((seg.end_ts - seg.start_ts).total_seconds() / 60, 1) if seg.end_ts else None
+            entry = {"segment_type": seg.segment_type, "avgEngagementProxy": avg, "durationMinutes": duration_min}
+            results.append(entry)
+            if avg is not None and (lowest is None or avg < lowest["avgEngagementProxy"]):
+                lowest = entry
+
+        insight = None
+        if lowest and lowest.get("durationMinutes"):
+            insight = (f"Engagement looked lowest during the {lowest['durationMinutes']:.0f}-minute "
+                       f"{lowest['segment_type'].replace('_', ' ')} segment.")
+
+        return {"available": True, "segments": results, "insight": insight}
+    finally:
+        db.close()
+
+
+# ─── Interventions ──────────────────────────────────────────────────────────
+
+class InterventionPayload(BaseModel):
+    class_id: int
+    session_id: Optional[str] = None
+    segment_type: Optional[str] = None
+    note: str
+
+
+@app.post("/api/interventions")
+def record_intervention(payload: InterventionPayload):
+    """Records a teacher's note that they tried something -- e.g. 'switched
+    to think-pair-share' -- in response to a segment's engagement dip."""
+    _require_db()
+    db = SessionLocal()
+    try:
+        iv = Intervention(
+            class_id=payload.class_id, session_id=payload.session_id,
+            segment_type=payload.segment_type, note=payload.note,
+        )
+        db.add(iv)
+        db.commit()
+        db.refresh(iv)
+        return {
+            "id": iv.id, "class_id": iv.class_id, "session_id": iv.session_id,
+            "segment_type": iv.segment_type, "note": iv.note,
+            "created_at": iv.created_at.isoformat() if iv.created_at else None,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/classes/{class_id}/interventions")
+def list_interventions(class_id: int):
+    if not SQLALCHEMY_AVAILABLE:
+        return {"interventions": []}
+    db = SessionLocal()
+    try:
+        rows = (db.query(Intervention)
+                .filter(Intervention.class_id == class_id)
+                .order_by(Intervention.created_at.desc())
+                .all())
+        return {"interventions": [
+            {"id": iv.id, "session_id": iv.session_id, "segment_type": iv.segment_type,
+             "note": iv.note, "created_at": iv.created_at.isoformat() if iv.created_at else None}
+            for iv in rows
+        ]}
+    finally:
+        db.close()
+
+
+@app.get("/api/classes/{class_id}/interventions/effectiveness")
+def intervention_effectiveness(class_id: int):
+    """Session-over-session comparison: for each recorded intervention,
+    compares that segment's average engagement proxy in the session right
+    after the intervention against the session right before it.
+
+    This is an honest average-delta comparison across two real sessions,
+    not a trained or learned model -- 'the system learns which
+    interventions work' means a teacher can see which past notes
+    correlated with a real bump, stated in the same numbers-only style as
+    the AI Weekly Report narrative, not that anything is being trained on
+    this data."""
+    if not SQLALCHEMY_AVAILABLE:
+        return {"available": False}
+    db = SessionLocal()
+    try:
+        interventions = (db.query(Intervention)
+                         .filter(Intervention.class_id == class_id)
+                         .order_by(Intervention.created_at.asc())
+                         .all())
+        if not interventions:
+            return {"available": False}
+
+        # Chronological list of distinct session_ids for this class, so we
+        # can find "the session right before/after" a given intervention.
+        segments = (db.query(LessonSegment)
+                   .filter(LessonSegment.class_id == class_id)
+                   .order_by(LessonSegment.start_ts.asc())
+                   .all())
+        session_order = []
+        seen = set()
+        for seg in segments:
+            if seg.session_id not in seen:
+                session_order.append(seg.session_id)
+                seen.add(seg.session_id)
+
+        def segment_avg(session_id, segment_type):
+            if not session_id or not segment_type:
+                return None
+            rows = (db.query(EmotionEvent.emotion_probs)
+                   .filter(EmotionEvent.session_id == session_id, EmotionEvent.segment_type == segment_type)
+                   .all())
+            vals = []
+            for (ep_json,) in rows:
+                try:
+                    vals.append(_engagement_proxy(json.loads(ep_json)))
+                except Exception:
+                    continue
+            return round(statistics.mean(vals), 1) if vals else None
+
+        results = []
+        for iv in interventions:
+            if not iv.session_id or not iv.segment_type or iv.session_id not in session_order:
+                results.append({
+                    "intervention_id": iv.id, "note": iv.note,
+                    "before": None, "after": None, "delta": None,
+                    "status": "Not enough session data to compare yet.",
+                })
+                continue
+            idx = session_order.index(iv.session_id)
+            before_id = session_order[idx - 1] if idx > 0 else None
+            after_id = session_order[idx + 1] if idx + 1 < len(session_order) else None
+            before = segment_avg(before_id, iv.segment_type)
+            after = segment_avg(after_id, iv.segment_type)
+            results.append({
+                "intervention_id": iv.id, "note": iv.note, "segment_type": iv.segment_type,
+                "before": before, "after": after,
+                "delta": round(after - before, 1) if (before is not None and after is not None) else None,
+                "status": None,
+            })
+
+        return {"available": True, "comparisons": results}
+    finally:
+        db.close()
 
 
 # ─── Reports ────────────────────────────────────────────────────────────────
