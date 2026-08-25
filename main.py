@@ -321,7 +321,8 @@ def list_class_students(class_id: int):
     finally:
         db.close()
 
-
+class ConsentPayload(BaseModel):
+    consent_status: str  # 'biometric' | 'non_biometric' | 'pending'
 @app.post("/api/students/{student_id}/consent")
 def set_student_consent(student_id: int, payload: ConsentPayload):
     if payload.consent_status not in ("biometric", "non_biometric", "pending"):
