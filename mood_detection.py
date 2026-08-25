@@ -538,9 +538,10 @@ class ExtendedMoodClassroomMonitor:
             scores["distracted"] = 75.0
             scores["attentive"] = 25.0
         elif head_away:
-            scores["attentive"] = 70.0
-            scores["focused"] = 20.0
-            scores["distracted"] = 10.0
+            scores["attentive"] = 10.0
+            scores["focused"] = 15.0
+            scores["distracted"] = 55.0
+            scores["looking_away"] = 20.0
         elif is_yawning:
             scores["yawning"] = 85.0
             scores["attentive"] = 15.0
