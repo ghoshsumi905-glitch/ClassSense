@@ -135,7 +135,7 @@ class ExtendedMoodClassroomMonitor:
                  load_weight_mood=0.4,
                  face_detection_confidence=0.35,
                  phone_pitch_threshold_deg=22.0, 
-                 phone_use_duration_seconds=120):
+                 phone_use_duration_seconds=5):
 
         self.attendance = attendance_system
         self.log_file = log_file
