@@ -420,9 +420,12 @@ class StartSessionResponse(BaseModel):
 
 
 @app.post("/api/attendance/start", response_model=StartSessionResponse)
-def start_attendance_session(class_name: str = Form("")):
+def start_attendance_session(class_name: str = Form(""), class_id: Optional[int] = Form(None)):
     session_id = str(uuid.uuid4())
-    attendance_sessions[session_id] = {"marked": set(), "class_name": class_name}
+    attendance_sessions[session_id] = {
+        "marked": set(), "class_name": class_name, "class_id": class_id,
+        "started_at": datetime.utcnow(),
+    }
     return {"session_id": session_id}
 
 
@@ -442,12 +445,45 @@ async def attendance_frame(session_id: str = Form(...), image: UploadFile = File
     return result
 
 
+# Assumption, stated plainly so it's defensible if asked: a teacher doing a
+# verbal roll call takes about this many seconds per student on average.
+MANUAL_ROLLCALL_SECONDS_PER_STUDENT = 1.5
+
+
+def _roster_count(class_id: Optional[int]) -> Optional[int]:
+    if class_id is None or not SQLALCHEMY_AVAILABLE:
+        return None
+    db = SessionLocal()
+    try:
+        return db.query(Student).filter(Student.class_id == class_id).count()
+    finally:
+        db.close()
+
+
 @app.post("/api/attendance/end")
 def end_attendance_session(session_id: str = Form(...)):
     if session_id not in attendance_sessions:
         raise HTTPException(status_code=404, detail="Unknown session_id.")
     session = attendance_sessions.pop(session_id)
     summary = attendance_system.finalize_session(session["marked"], session_id)
+
+    started_at = session.get("started_at")
+    automated_seconds = (datetime.utcnow() - started_at).total_seconds() if started_at else None
+    roster_count = _roster_count(session.get("class_id"))
+
+    time_saved = None
+    if automated_seconds is not None and roster_count:
+        manual_estimate_seconds = roster_count * MANUAL_ROLLCALL_SECONDS_PER_STUDENT
+        time_saved = {
+            "automatedSeconds": round(automated_seconds, 1),
+            "manualEstimateSeconds": manual_estimate_seconds,
+            "savedSeconds": round(max(0.0, manual_estimate_seconds - automated_seconds), 1),
+            "rosterCount": roster_count,
+            "assumptionSecondsPerStudent": MANUAL_ROLLCALL_SECONDS_PER_STUDENT,
+        }
+
+    if isinstance(summary, dict):
+        summary["timeSaved"] = time_saved
     return summary
 
 
@@ -866,6 +902,48 @@ def list_interventions(class_id: int):
     finally:
         db.close()
 
+@app.get("/api/classes/{class_id}/recommended-action")
+def recommended_action(class_id: int):
+    """Combines session-level (lowest-engagement segment from the most
+    recent session) and student-level (existing <65% flag rule) signals
+    into one recommendation. Rule-based, same numbers-only philosophy as
+    the AI Weekly Report narrative -- never a diagnostic claim, just what
+    the logged data actually shows."""
+    if not SQLALCHEMY_AVAILABLE:
+        return {"available": False}
+    db = SessionLocal()
+    try:
+        latest_segment = (db.query(LessonSegment)
+                          .filter(LessonSegment.class_id == class_id)
+                          .order_by(LessonSegment.start_ts.desc())
+                          .first())
+        latest_session_id = latest_segment.session_id if latest_segment else None
+    finally:
+        db.close()
+
+    session_action = None
+    if latest_session_id:
+        seg_data = segment_engagement(latest_session_id)
+        if seg_data.get("available") and seg_data.get("insight"):
+            session_action = seg_data["insight"]
+
+    student_action = None
+    if os.path.isfile("cognitive_load_log.csv"):
+        df = pd.read_csv("cognitive_load_log.csv")
+        if not df.empty:
+            df["Engagement"] = (100 - df["CognitiveLoad"]).clip(lower=0)
+            per_student = df.groupby("Name")["Engagement"].mean()
+            per_student = per_student[~per_student.index.astype(str).str.startswith("Unknown")]
+            flagged = per_student[per_student < 65].sort_values()
+            if len(flagged) > 0:
+                lowest_name = flagged.index[0]
+                lowest_val = round(flagged.iloc[0])
+                student_action = f"{lowest_name} is averaging {lowest_val}% engagement — worth a check-in."
+
+    if not session_action and not student_action:
+        return {"available": False}
+
+    return {"available": True, "sessionAction": session_action, "studentAction": student_action}
 
 @app.get("/api/classes/{class_id}/interventions/effectiveness")
 def intervention_effectiveness(class_id: int):
@@ -998,6 +1076,38 @@ def reports_summary():
         "timeline": timeline,
     }
 
+from fastapi.responses import StreamingResponse
+import csv as csv_module
+
+
+@app.get("/api/classes/{class_id}/export/sis")
+def export_sis_csv(class_id: int):
+    """Mock SIS-compatible attendance export. Generic Name/Date/Status/Class
+    schema -- not a real vendor integration, but a believable stand-in for
+    'syncs to the school's existing system' until a specific SIS/format is
+    chosen."""
+    _require_db()
+    db = SessionLocal()
+    try:
+        cls = db.query(SchoolClass).filter(SchoolClass.id == class_id).first()
+        if not cls:
+            raise HTTPException(status_code=404, detail="Class not found.")
+        students = db.query(Student).filter(Student.class_id == class_id).order_by(Student.name.asc()).all()
+    finally:
+        db.close()
+
+    buf = io.StringIO()
+    writer = csv_module.writer(buf)
+    writer.writerow(["StudentName", "Date", "ClassYear", "Period", "Status"])
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    for s in students:
+        status = "Present" if s.consent_status != "pending" else "Unknown"
+        writer.writerow([s.name, today, cls.class_year, cls.period_label or "", status])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=classsense_export_{class_id}_{today}.csv"}
+    )
 
 def _weekly_trend_narrative(daily_engagement, avg_engagement, prev_avg_engagement,
                              flagged_count, most_improved, most_declined, num_students):
