@@ -454,7 +454,7 @@ def end_attendance_session(session_id: str = Form(...)):
 # ─── Mood / attentiveness sessions ─────────────────────────────────────────
 
 @app.post("/api/mood/start", response_model=StartSessionResponse)
-def start_mood_session(class_id: Optional[int] = Form(None)):
+def start_mood_session(class_id: Optional[int] = (None)):
     session_id = str(uuid.uuid4())
     monitor = ExtendedMoodClassroomMonitor(attendance_system, log_file="cognitive_load_log.csv")
     mood_sessions[session_id] = {"monitor": monitor, "frame_counter": 0, "class_id": class_id}
