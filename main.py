@@ -207,30 +207,31 @@ def _require_db():
 
 # ─── Classes & Roster ───────────────────────────────────────────────────────
 
+class ClassCreatePayload(BaseModel):
+    professor_name: str
+    class_year: str
+    period_id: Optional[str] = None
+    period_label: Optional[str] = None
+
+
 @app.post("/api/classes")
-def create_class(professor_name: str = Form(...), class_year: str = Form(...),
-                  period_id: str = Form(""), period_label: str = Form("")):
-    """Creates a class/session record: professor + year + period. Every
-    roster, student, segment, and intervention below is scoped to this id,
-    so 'Amara Diallo' in 1st Year and 'Amara Diallo' in 3rd Year are two
-    separate Student rows and never collide."""
+def create_class(payload: ClassCreatePayload):
     _require_db()
     db = SessionLocal()
     try:
         cls = SchoolClass(
-            professor_name=professor_name, class_year=class_year,
-            period_id=period_id or None, period_label=period_label or None,
+            professor_name=payload.professor_name, class_year=payload.class_year,
+            period_id=payload.period_id, period_label=payload.period_label,
         )
         db.add(cls)
         db.commit()
         db.refresh(cls)
         return {
-            "id": cls.id, "professor_name": cls.professor_name, "class_year": cls.class_year,
+            "class_id": cls.id, "professor_name": cls.professor_name, "class_year": cls.class_year,
             "period_id": cls.period_id, "period_label": cls.period_label,
         }
     finally:
         db.close()
-
 
 @app.get("/api/classes")
 def list_classes(class_year: Optional[str] = None):
@@ -286,8 +287,22 @@ def import_roster(class_id: int, payload: RosterImportPayload):
     finally:
         db.close()
 
+class RosterImportPayloadFlat(BaseModel):
+    class_id: int
+    names: List[str]
+
+
+@app.post("/api/students/roster")
+def import_roster_flat(payload: RosterImportPayloadFlat):
+    return import_roster(payload.class_id, RosterImportPayload(names=payload.names))
+
+
+@app.get("/api/students/roster")
+def get_roster_flat(class_id: int):
+    return list_class_students(class_id)
 
 @app.get("/api/classes/{class_id}/students")
+
 def list_class_students(class_id: int):
     """Persistent, per-class-year student directory. This is the
     replacement for deriving the Students page from cognitive_load_log.csv
@@ -307,8 +322,21 @@ def list_class_students(class_id: int):
         db.close()
 
 
-class ConsentPayload(BaseModel):
-    status: str  # 'biometric' | 'non_biometric' | 'pending'
+@app.post("/api/students/{student_id}/consent")
+def set_student_consent(student_id: int, payload: ConsentPayload):
+    if payload.consent_status not in ("biometric", "non_biometric", "pending"):
+        raise HTTPException(status_code=400, detail="consent_status must be 'biometric', 'non_biometric', or 'pending'.")
+    _require_db()
+    db = SessionLocal()
+    try:
+        s = db.query(Student).filter(Student.id == student_id).first()
+        if not s:
+            raise HTTPException(status_code=404, detail="Student not found.")
+        s.consent_status = payload.consent_status
+        db.commit()
+        return {"id": s.id, "name": s.name, "consent_status": s.consent_status}
+    finally:
+        db.close()
 
 
 @app.post("/api/students/{student_id}/consent")
