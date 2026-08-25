@@ -3,7 +3,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   BarChart, Bar, Cell, PieChart, Pie, Sector
 } from 'recharts'
-import { apiPost, apiPostJson, apiGet } from './api'
+import { apiPost, apiPostJson, apiGet, API_URL } from './api'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 type Screen =
@@ -1075,6 +1075,7 @@ function AttendanceScreen({ onBack, dark, classId, roster }: {
   const [seconds, setSeconds] = useState(0)
   const [sheetOpen, setSheetOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [endSummary, setEndSummary] = useState<any>(null)
   const busyRef = useRef(false)       // prevents overlapping requests
   const stoppedRef = useRef(false)    // stops the loop cleanly on unmount/end
 
@@ -1183,7 +1184,11 @@ function AttendanceScreen({ onBack, dark, classId, roster }: {
     if (sessionId) {
       const form = new FormData()
       form.append('session_id', sessionId)
-      await apiPost('/api/attendance/end', form)
+      const summary = await apiPost('/api/attendance/end', form)
+      if (summary?.timeSaved) {
+        setEndSummary(summary)
+        return
+      }
     }
     onBack()
   }
@@ -1297,6 +1302,35 @@ function AttendanceScreen({ onBack, dark, classId, roster }: {
                 </div>
               ))}
             </div>
+          </div>
+        )}
+        {endSummary && (
+          <div style={{
+            position: 'absolute', inset: 0, background: 'rgba(10,21,32,0.92)', zIndex: 20,
+            display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+            padding: 24, textAlign: 'center',
+          }}>
+            <div style={{ fontSize: 40, marginBottom: 12 }}>⏱️</div>
+            <div style={{ color: 'white', fontSize: 18, fontWeight: 800, marginBottom: 6 }}>Attendance complete</div>
+            {endSummary.timeSaved ? (
+              <p style={{ color: 'rgba(255,255,255,0.8)', fontSize: 13, lineHeight: 1.6, maxWidth: 260 }}>
+                Took about {Math.round(endSummary.timeSaved.automatedSeconds)}s automated vs an estimated{' '}
+                {Math.round(endSummary.timeSaved.manualEstimateSeconds)}s for manual roll call —{' '}
+                <span style={{ color: '#5bb8a0', fontWeight: 800 }}>
+                  saved ~{Math.round(endSummary.timeSaved.savedSeconds)}s
+                </span>{' '}
+                for {endSummary.timeSaved.rosterCount} students.
+              </p>
+            ) : (
+              <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: 13 }}>Session ended.</p>
+            )}
+            <button onClick={onBack} style={{
+              marginTop: 20, padding: '12px 28px', borderRadius: 12,
+              background: 'linear-gradient(135deg, #3d84a8, #5bb8a0)',
+              border: 'none', color: 'white', fontSize: 14, fontWeight: 700, cursor: 'pointer',
+            }}>
+              Done
+            </button>
           </div>
         )}
 
@@ -1664,7 +1698,7 @@ function MoodScreen({ onBack, dark }: { onBack: () => void; dark: boolean }) {
 }
 
 // ─── Screen: Reports ──────────────────────────────────────────────────────────
-function ReportsScreen({ onStudent, onWeekly, dark }: { onStudent: (s: any) => void; onWeekly: () => void; dark: boolean }) {
+function ReportsScreen({ onStudent, onWeekly, dark, classId }: { onStudent: (s: any) => void; onWeekly: () => void; dark: boolean; classId: number | null }) {
   const [data, setData] = useState<{
     students: { name: string; engagementAvg: number; flag: boolean }[]
     avgEngagement: number | null
@@ -1673,6 +1707,7 @@ function ReportsScreen({ onStudent, onWeekly, dark }: { onStudent: (s: any) => v
     timeline: { t: string; engagement: number }[]
   } | null>(null)
   const [loading, setLoading] = useState(true)
+  const [action, setAction] = useState<{ sessionAction: string | null; studentAction: string | null } | null>(null)
 
   useEffect(() => {
     apiGet('/api/reports/summary')
@@ -1680,6 +1715,13 @@ function ReportsScreen({ onStudent, onWeekly, dark }: { onStudent: (s: any) => v
       .catch(() => setData(null))
       .finally(() => setLoading(false))
   }, [])
+
+  useEffect(() => {
+    if (classId == null) return
+    apiGet(`/api/classes/${classId}/recommended-action`)
+      .then(data => setAction(data.available ? data : null))
+      .catch(() => setAction(null))
+  }, [classId])
 
   if (loading) {
     return <div style={{ padding: 40, textAlign: 'center', color: dark ? '#7aa5c0' : '#6b8ba4' }}>Loading reports…</div>
@@ -1732,6 +1774,32 @@ function ReportsScreen({ onStudent, onWeekly, dark }: { onStudent: (s: any) => v
           </div>
         ))}
       </div>
+
+      {action && (action.sessionAction || action.studentAction) && (
+        <div style={{
+          padding: '14px 16px', borderRadius: 16,
+          background: dark ? '#1e2e1a' : '#fdfaf3',
+          border: `1.5px solid ${dark ? '#3a4a28' : '#e8d8a0'}`,
+          display: 'flex', flexDirection: 'column', gap: 8,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 16 }}>💡</span>
+            <p style={{ margin: 0, fontSize: 12, fontWeight: 800, color: dark ? '#d4c870' : '#9a7a20', letterSpacing: 0.3 }}>
+              RECOMMENDED NEXT ACTION
+            </p>
+          </div>
+          {action.sessionAction && (
+            <p style={{ margin: 0, fontSize: 12.5, color: dark ? '#e2edf6' : '#1a2b3c', fontWeight: 500, lineHeight: 1.5 }}>
+              {action.sessionAction}
+            </p>
+          )}
+          {action.studentAction && (
+            <p style={{ margin: 0, fontSize: 12.5, color: dark ? '#e2edf6' : '#1a2b3c', fontWeight: 500, lineHeight: 1.5 }}>
+              {action.studentAction}
+            </p>
+          )}
+        </div>
+      )}
 
       <div style={{ padding: '16px', borderRadius: 16, background: dark ? '#162535' : '#ffffff', border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}` }}>
         <p style={{ margin: '0 0 12px', fontSize: 12, fontWeight: 700, color: dark ? '#7aa5c0' : '#6b8ba4', letterSpacing: 0.3 }}>
@@ -2054,7 +2122,7 @@ function ReportDetailScreen({ student, onBack, dark }: { student: typeof STUDENT
             {(['Happy', 'Neutral', 'Confused', 'Furrowed', 'Sad', 'Surprised'] as const).map(k => (
               <Line key={k} type="monotone" dataKey={k} stroke={MOOD_DETAIL_COLORS[k]}
                 strokeWidth={k === 'Happy' || k === 'Neutral' ? 2 : 1.5}
-                dot={false} strokeDasharray={k === 'Sad' || k === 'Fearful' ? '4 3' : undefined} />
+                dot={false} strokeDasharray={k === 'Sad' ? '4 3' : undefined} />
             ))}
           </LineChart>
         </ResponsiveContainer>
@@ -2129,10 +2197,11 @@ function ReportDetailScreen({ student, onBack, dark }: { student: typeof STUDENT
 }
 
 // ─── Screen: Students ─────────────────────────────────────────────────────────
-function StudentsScreen({ onStudent, dark }: { onStudent: (s: any) => void; dark: boolean }) {
+function StudentsScreen({ onStudent, dark, classId }: { onStudent: (s: any) => void; dark: boolean; classId: number | null }) {
   const [students, setStudents] = useState<{ name: string; engagementAvg: number; flag: boolean }[]>([])
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
+  const [faceStatus, setFaceStatus] = useState<Record<string, boolean>>({})
 
   useEffect(() => {
     apiGet('/api/reports/summary')
@@ -2140,6 +2209,17 @@ function StudentsScreen({ onStudent, dark }: { onStudent: (s: any) => void; dark
       .catch(() => setStudents([]))
       .finally(() => setLoading(false))
   }, [])
+
+  useEffect(() => {
+    if (classId == null) return
+    apiGet(`/api/classes/${classId}/students`)
+      .then(data => {
+        const map: Record<string, boolean> = {}
+        ;(data.students || []).forEach((s: any) => { map[s.name] = !!s.face_registered })
+        setFaceStatus(map)
+      })
+      .catch(() => setFaceStatus({}))
+  }, [classId])
 
   const filtered = students.filter(s => s.name.toLowerCase().includes(query.toLowerCase()))
 
@@ -2190,6 +2270,11 @@ function StudentsScreen({ onStudent, dark }: { onStudent: (s: any) => void; dark
               <div style={{ flex: 1 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span style={{ fontSize: 15, fontWeight: 700, color: dark ? '#e2edf6' : '#1a2b3c' }}>{student.name}</span>
+                  {faceStatus[student.name] && (
+                    <span title="Face ID saved — carries over each year" style={{ display: 'inline-flex' }}>
+                      {icons.fingerprint('#5bb8a0')}
+                    </span>
+                  )}
                   {student.flag && icons.flag()}
                 </div>
               </div>
@@ -2302,7 +2387,7 @@ function StudentDetailScreen({ student, onBack, dark }: {
 }
 
 // ─── Screen: Settings ─────────────────────────────────────────────────────────
-function SettingsScreen({ dark, onToggleDark }: { dark: boolean; onToggleDark: () => void }) {
+function SettingsScreen({ dark, onToggleDark, classId }: { dark: boolean; onToggleDark: () => void; classId: number | null }) {
   const [camPerm, setCamPerm] = useState(true)
   const [retention, setRetention] = useState(30)
   const [autoDelete, setAutoDelete] = useState(true)
@@ -2381,8 +2466,15 @@ function SettingsScreen({ dark, onToggleDark }: { dark: boolean; onToggleDark: (
           </div>
         } />
         <Row icon={icons.shield('#3d84a8')} label="Auto-delete face data" right={<Toggle value={autoDelete} onChange={() => setAutoDelete(!autoDelete)} />} />
-        <Row icon={icons.lock('#3d84a8')} label="Student data export" right={
-          <span style={{ fontSize: 13, color: '#3d84a8', fontWeight: 600 }}>Request →</span>
+        <Row icon={icons.lock('#3d84a8')} label="Export to school SIS (CSV)" right={
+          classId != null ? (
+            <a href={`${API_URL}/api/classes/${classId}/export/sis`} download
+              style={{ fontSize: 13, color: '#3d84a8', fontWeight: 600, textDecoration: 'none' }}>
+              Download →
+            </a>
+          ) : (
+            <span style={{ fontSize: 12, color: dark ? '#7aa5c0' : '#6b8ba4', fontWeight: 500 }}>No active class</span>
+          )
         } border={false} />
       </Section>
 
@@ -2510,12 +2602,12 @@ export default function App() {
           <AttendanceScreen dark={dark} onBack={() => setScreen('home')} classId={classId} roster={roster} />
         )}
         {screen === 'mood' && <MoodScreen dark={dark} onBack={() => { setScreen('home'); setNavTab('home') }} />}
-        {screen === 'reports' && <ReportsScreen dark={dark} onStudent={s => { setSelectedStudent(s); setScreen('report-detail') }} onWeekly={() => setScreen('weekly-report')} />}
+        {screen === 'reports' && <ReportsScreen dark={dark} classId={classId} onStudent={s => { setSelectedStudent(s); setScreen('report-detail') }} onWeekly={() => setScreen('weekly-report')} />}
         {screen === 'report-detail' && selectedStudent && <ReportDetailScreen dark={dark} student={selectedStudent} onBack={() => setScreen('reports')} />}
         {screen === 'weekly-report' && <WeeklyReportScreen dark={dark} onBack={() => setScreen('reports')} />}
-        {screen === 'students' && <StudentsScreen dark={dark} onStudent={s => { setSelectedStudent(s); setScreen('student-detail') }} />}
+        {screen === 'students' && <StudentsScreen dark={dark} classId={classId} onStudent={s => { setSelectedStudent(s); setScreen('student-detail') }} />}
         {screen === 'student-detail' && selectedStudent && <StudentDetailScreen dark={dark} student={selectedStudent} onBack={() => setScreen('students')} />}
-        {screen === 'settings' && <SettingsScreen dark={dark} onToggleDark={() => setDark(d => !d)} />}
+        {screen === 'settings' && <SettingsScreen dark={dark} classId={classId} onToggleDark={() => setDark(d => !d)} />}
       </div>
 
       {needsNav && !fullscreen && (
