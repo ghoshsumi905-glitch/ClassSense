@@ -46,6 +46,34 @@ to a person. Route flags to a counselor/staff member for actual
 follow-up rather than storing or displaying diagnostic-sounding labels
 per-student long-term. Also worth checking your institution's policy on
 recording/analyzing student faces before deploying this beyond testing.
+
+--------------------------------------------------------------------
+FIXES IN THIS REVISION (see chat for the full writeup):
+
+1. CRASH FIX -- _update_smoothed_emotions() now normalizes the raw
+   dict returned by predict_emotion_full() to this class's exact
+   emotion_keys set (missing keys filled with 0.0) before it's ever
+   stored in person_emotion_history. Previously, on a person's first
+   successful emotion read, the RAW external dict was stored as-is,
+   and process_frame()'s entropy calculation indexed it with
+   smoothed[k] (no .get()). If predict_emotion_full()'s key set ever
+   drifted from self.emotion_keys -- different casing, a renamed
+   label, a class missing on a given frame -- that line threw an
+   uncaught KeyError, which FastAPI turns into a 500. Starlette
+   generates that 500 from outside the CORS middleware, so it shows
+   up in the browser as a misleading "blocked by CORS policy" error
+   instead of the real cause. process_frame() also now reads
+   smoothed with .get(k, 0.0) as a second line of defense.
+2. _detect_faces() now guards against a None/empty frame instead of
+   throwing on frame_bgr.shape.
+3. ATTENTIVENESS SCORING FIX -- the "head turned away, but gaze not
+   confirmed away" branch in _score_attentiveness() was scoring
+   "attentive" as the dominant label (70/20/10 split favoring
+   attentive), which is backwards: head_away is only True when head
+   pose is confidently NOT front-facing. That branch now leans
+   "distracted" instead, with lower confidence than the
+   both-signals-agree "looking_away" case above it.
+--------------------------------------------------------------------
 """
 
 """
@@ -222,6 +250,14 @@ class ExtendedMoodClassroomMonitor:
     # ---------- face detection ----------
 
     def _detect_faces(self, frame_bgr):
+        # Defensive guard: if the decoded frame from main.py is None or
+        # empty (a corrupt/short upload, camera not warmed up yet, etc.),
+        # bail out with no faces instead of throwing on frame_bgr.shape --
+        # that AttributeError was an uncaught-exception crash path just
+        # like the emotion-key KeyError below, and would show up in the
+        # browser as the same misleading CORS error.
+        if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
+            return []
         h, w = frame_bgr.shape[:2]
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         results = self.mp_face_detection.process(frame_rgb)
@@ -491,6 +527,18 @@ class ExtendedMoodClassroomMonitor:
             return None
 
     def _update_smoothed_emotions(self, name, current):
+        # Normalize to this class's exact key set BEFORE it ever gets
+        # stored in person_emotion_history. predict_emotion_full() is an
+        # external dependency; if its keys ever drift from self.emotion_keys
+        # (casing, a renamed/missing class on a given frame), storing the
+        # raw dict as-is used to let a later `smoothed[k]` lookup in
+        # process_frame() throw an uncaught KeyError -> FastAPI 500 ->
+        # shows up in the browser as a misleading CORS error, since
+        # Starlette generates that 500 response outside the CORS
+        # middleware. Coercing to floats also protects against a stray
+        # None/non-numeric value from the model.
+        current = {k: float(current.get(k, 0.0) or 0.0) for k in self.emotion_keys}
+
         self.person_temporal_context[name].append(current.copy())
         if len(self.person_temporal_context[name]) > self.max_temporal_samples:
             self.person_temporal_context[name].pop(0)
@@ -538,10 +586,15 @@ class ExtendedMoodClassroomMonitor:
             scores["distracted"] = 75.0
             scores["attentive"] = 25.0
         elif head_away:
-            scores["attentive"] = 10.0
-            scores["focused"] = 15.0
+            # FIX: head pose is confidently NOT front-facing here (that's
+            # what head_away means). Gaze not also confirming it doesn't
+            # make this "attentive" -- it just means we're less sure it's
+            # full looking_away. Lean distracted, softer than the
+            # both-signals-agree branch above.
             scores["distracted"] = 55.0
             scores["looking_away"] = 20.0
+            scores["focused"] = 15.0
+            scores["attentive"] = 10.0
         elif is_yawning:
             scores["yawning"] = 85.0
             scores["attentive"] = 15.0
@@ -750,7 +803,10 @@ class ExtendedMoodClassroomMonitor:
             else:
                 smoothed = self.person_emotion_history[name]
 
-            entropy_val = self._entropy([smoothed[k] for k in self.emotion_keys]) if smoothed else 0.0
+            # .get(k, 0.0) here (not smoothed[k]) is the second line of
+            # defense against a key-set mismatch from the emotion model --
+            # see _update_smoothed_emotions for the primary fix.
+            entropy_val = self._entropy([smoothed.get(k, 0.0) for k in self.emotion_keys]) if smoothed else 0.0
 
             att_scores, perclos = self._score_attentiveness(name, head_direction, direction_confidence, gaze_offset, ear, mar)
             mood_scores = self._score_mood(name, smoothed or {}, entropy_val, smile, tension)
