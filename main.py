@@ -34,6 +34,13 @@ CHANGELOG (this revision):
     segment, and /api/classes/{id}/interventions/effectiveness compares
     that segment's engagement in the session right before vs. right after
     -- an honest average-delta comparison, not a trained model.
+  - BUGFIX: removed a duplicate /api/students/{student_id}/consent route.
+    Two identical route paths were declared; FastAPI matches routes in
+    declaration order, so the first (correct) one was always winning, but
+    the second was dead code that referenced a nonexistent payload.status
+    field (ConsentPayload only has consent_status) -- would have thrown
+    an AttributeError -> 500 if it were ever reachable. Deleted the
+    duplicate rather than leave a landmine in the file.
 
 STILL BLOCKED: recognition confidence scores + review queue + manual
 correction (the "uncertain match" workflow) depend entirely on
@@ -323,21 +330,6 @@ def list_class_students(class_id: int):
 
 class ConsentPayload(BaseModel):
     consent_status: str  # 'biometric' | 'non_biometric' | 'pending'
-@app.post("/api/students/{student_id}/consent")
-def set_student_consent(student_id: int, payload: ConsentPayload):
-    if payload.consent_status not in ("biometric", "non_biometric", "pending"):
-        raise HTTPException(status_code=400, detail="consent_status must be 'biometric', 'non_biometric', or 'pending'.")
-    _require_db()
-    db = SessionLocal()
-    try:
-        s = db.query(Student).filter(Student.id == student_id).first()
-        if not s:
-            raise HTTPException(status_code=404, detail="Student not found.")
-        s.consent_status = payload.consent_status
-        db.commit()
-        return {"id": s.id, "name": s.name, "consent_status": s.consent_status}
-    finally:
-        db.close()
 
 
 @app.post("/api/students/{student_id}/consent")
@@ -347,15 +339,15 @@ def set_student_consent(student_id: int, payload: ConsentPayload):
     alternative (e.g. manual roll call for that student). This is a
     per-student flag, not all-or-nothing for the class -- a class can mix
     biometric and non-biometric students."""
-    if payload.status not in ("biometric", "non_biometric", "pending"):
-        raise HTTPException(status_code=400, detail="status must be 'biometric', 'non_biometric', or 'pending'.")
+    if payload.consent_status not in ("biometric", "non_biometric", "pending"):
+        raise HTTPException(status_code=400, detail="consent_status must be 'biometric', 'non_biometric', or 'pending'.")
     _require_db()
     db = SessionLocal()
     try:
         s = db.query(Student).filter(Student.id == student_id).first()
         if not s:
             raise HTTPException(status_code=404, detail="Student not found.")
-        s.consent_status = payload.status
+        s.consent_status = payload.consent_status
         db.commit()
         return {"id": s.id, "name": s.name, "consent_status": s.consent_status}
     finally:
