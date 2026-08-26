@@ -77,8 +77,15 @@ body {
   color: var(--foreground);
 }
 
-::-webkit-scrollbar { width: 0; height: 0; }
-scrollbar-width: none;
+html {
+  scrollbar-width: none;
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
 
 .phone-scroll::-webkit-scrollbar { display: none; }
 .phone-scroll { scrollbar-width: none; overflow-y: auto; }

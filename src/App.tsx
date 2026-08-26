@@ -224,6 +224,19 @@ const icons = {
   clipboard: (c = 'currentColor') => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M9 2h6a1 1 0 0 1 1 1v2H8V3a1 1 0 0 1 1-1z" /><rect x="4" y="4" width="16" height="18" rx="2" /><line x1="8" y1="11" x2="16" y2="11" /><line x1="8" y1="15" x2="16" y2="15" /></svg>,
 }
 
+// ─── Responsive breakpoint ──────────────────────────────────────────────────
+function useIsDesktop(breakpoint = 768) {
+  const [isDesktop, setIsDesktop] = useState(
+    typeof window !== 'undefined' ? window.innerWidth > breakpoint : false
+  )
+  useEffect(() => {
+    const onResize = () => setIsDesktop(window.innerWidth > breakpoint)
+    window.addEventListener('resize', onResize)
+    onResize()
+    return () => window.removeEventListener('resize', onResize)
+  }, [breakpoint])
+  return isDesktop
+}
 // ─── Layout Shell ─────────────────────────────────────────────────────────────
 function PhoneFrame({ children, dark }: { children: React.ReactNode; dark: boolean }) {
   return (
@@ -296,6 +309,71 @@ function BottomNav({ active, onNav, dark }: { active: NavTab; onNav: (t: NavTab)
           </button>
         )
       })}
+    </div>
+  )
+}
+
+// ─── Sidebar Nav (desktop) ──────────────────────────────────────────────────
+function SidebarNav({ active, onNav, dark }: { active: NavTab; onNav: (t: NavTab) => void; dark: boolean }) {
+  const tabs: { key: NavTab; label: string; icon: (c?: string) => JSX.Element }[] = [
+    { key: 'home', label: 'Home', icon: icons.home },
+    { key: 'students', label: 'Students', icon: icons.users },
+    { key: 'monitor', label: 'Monitor', icon: icons.eye },
+    { key: 'reports', label: 'Reports', icon: icons.chart },
+    { key: 'settings', label: 'Settings', icon: icons.settings },
+  ]
+  return (
+    <div style={{
+      width: 220, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 4,
+      padding: '24px 12px', borderRight: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
+      background: dark ? '#162535' : '#ffffff',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '0 10px 24px' }}>
+        <div style={{
+          width: 34, height: 34, borderRadius: 10,
+          background: 'linear-gradient(135deg, #3d84a8, #5bb8a0)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="8" r="4" /><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7" />
+          </svg>
+        </div>
+        <span style={{ fontSize: 16, fontWeight: 800, color: dark ? '#e2edf6' : '#1a2b3c' }}>ClassSense</span>
+      </div>
+      {tabs.map(({ key, label, icon }) => {
+        const isActive = active === key
+        const col = isActive ? '#3d84a8' : (dark ? '#7aa5c0' : '#6b8ba4')
+        return (
+          <button key={key} onClick={() => onNav(key)} style={{
+            display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px',
+            borderRadius: 10, border: 'none', cursor: 'pointer', textAlign: 'left',
+            background: isActive ? (dark ? '#1a2e40' : '#eef4fb') : 'transparent',
+          }}>
+            {icon(col)}
+            <span style={{ fontSize: 14, fontWeight: 700, color: col }}>{label}</span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+// ─── Desktop Shell ───────────────────────────────────────────────────────────
+function DesktopShell({ children, dark, active, onNav }: {
+  children: React.ReactNode; dark: boolean; active: NavTab; onNav: (t: NavTab) => void
+}) {
+  return (
+    <div style={{
+      width: '100%', minHeight: '100vh', display: 'flex',
+      background: dark ? '#0f1d2b' : '#f0f6fc',
+    }}>
+      <SidebarNav active={active} onNav={onNav} dark={dark} />
+      <div style={{
+        flex: 1, maxWidth: 1100, margin: '0 auto', width: '100%',
+        display: 'flex', flexDirection: 'column', minHeight: '100vh',
+      }}>
+        {children}
+      </div>
     </div>
   )
 }
@@ -2498,22 +2576,19 @@ function SettingsScreen({ dark, onToggleDark, classId }: { dark: boolean; onTogg
 }
 
 // ─── Root App ─────────────────────────────────────────────────────────────────
+// ─── Root App ─────────────────────────────────────────────────────────────────
 export default function App() {
+  const isDesktop = useIsDesktop()
   const [dark, setDark] = useState(false)
   const [screen, setScreen] = useState<Screen>('login')
   const [navTab, setNavTab] = useState<NavTab>('home')
   const [selectedStudent, setSelectedStudent] = useState<typeof STUDENTS[0] | null>(null)
 
-  // Session/login details collected on the login screen — professor name,
-  // class year, and the selected class period. These now feed straight
-  // into POST /api/classes once the teacher accepts the consent screen.
   const [professorName, setProfessorName] = useState('')
   const [classYear, setClassYear] = useState<ClassYear>(CLASS_YEARS[0])
   const [periodId, setPeriodId] = useState(PERIODS[0].id)
   const periodLabel = PERIODS.find(p => p.id === periodId)?.label ?? PERIODS[0].label
 
-  // Class + roster state, threaded down to RegistrationScreen and
-  // AttendanceScreen so both operate on the right class_id.
   const [classId, setClassId] = useState<number | null>(null)
   const [roster, setRoster] = useState<RosterStudent[]>([])
   const [creatingClass, setCreatingClass] = useState(false)
@@ -2538,8 +2613,6 @@ export default function App() {
     setScreen('consent')
   }
 
-  // Teacher accepts the camera/consent notice -> create the SchoolClass row
-  // (step 1 of the workflow) -> move on to roster import (step 2).
   async function handleConsentAccept() {
     setCreatingClass(true)
     setClassError(null)
@@ -2577,63 +2650,67 @@ export default function App() {
   const needsNav = ['home', 'students', 'mood', 'reports', 'report-detail', 'weekly-report', 'student-detail', 'settings'].includes(screen)
   const fullscreen = ['attendance', 'mood'].includes(screen)
 
+  const screenContent = (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      {screen === 'login' && <LoginScreen dark={dark} onNext={handleLoginNext} />}
+      {screen === 'consent' && (
+        <ConsentScreen dark={dark} onAccept={handleConsentAccept} creating={creatingClass} error={classError} />
+      )}
+      {screen === 'roster-import' && classId != null && (
+        <RosterImportScreen dark={dark} classId={classId} onImported={handleRosterImported} />
+      )}
+      {screen === 'student-consent' && classId != null && (
+        <StudentConsentScreen dark={dark} classId={classId} roster={roster} onDone={handleConsentDone} />
+      )}
+      {screen === 'home' && (
+        <HomeScreen dark={dark} onNav={handleNav} onScreen={s => setScreen(s)}
+          professorName={professorName} classYear={classYear} periodLabel={periodLabel} />
+      )}
+      {screen === 'registration' && (
+        <RegistrationScreen dark={dark} onBack={() => setScreen('home')}
+          classId={classId} roster={roster} onRegistered={handleStudentRegistered} />
+      )}
+      {screen === 'attendance' && (
+        <AttendanceScreen dark={dark} onBack={() => setScreen('home')} classId={classId} roster={roster} />
+      )}
+      {screen === 'mood' && <MoodScreen dark={dark} onBack={() => { setScreen('home'); setNavTab('home') }} />}
+      {screen === 'reports' && <ReportsScreen dark={dark} classId={classId} onStudent={s => { setSelectedStudent(s); setScreen('report-detail') }} onWeekly={() => setScreen('weekly-report')} />}
+      {screen === 'report-detail' && selectedStudent && <ReportDetailScreen dark={dark} student={selectedStudent} onBack={() => setScreen('reports')} />}
+      {screen === 'weekly-report' && <WeeklyReportScreen dark={dark} onBack={() => setScreen('reports')} />}
+      {screen === 'students' && <StudentsScreen dark={dark} classId={classId} onStudent={s => { setSelectedStudent(s); setScreen('student-detail') }} />}
+      {screen === 'student-detail' && selectedStudent && <StudentDetailScreen dark={dark} student={selectedStudent} onBack={() => setScreen('students')} />}
+      {screen === 'settings' && <SettingsScreen dark={dark} classId={classId} onToggleDark={() => setDark(d => !d)} />}
+    </div>
+  )
+
+  const darkModeFab = (screen === 'login' || screen === 'consent' || screen === 'roster-import' || screen === 'student-consent') && (
+    <div style={{ position: 'absolute', top: 52, right: 16, zIndex: 10 }}>
+      <button onClick={() => setDark(d => !d)} style={{
+        width: 34, height: 34, borderRadius: 17,
+        background: dark ? '#162535' : '#ffffff',
+        border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
+        cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}>
+        {dark ? icons.sun('#3d84a8') : icons.moon('#3d84a8')}
+      </button>
+    </div>
+  )
+
+  if (isDesktop) {
+    return (
+      <DesktopShell dark={dark} active={navTab} onNav={handleNav}>
+        {screenContent}
+        <style>{`@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }`}</style>
+      </DesktopShell>
+    )
+  }
+
   return (
     <PhoneFrame dark={dark}>
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        {screen === 'login' && <LoginScreen dark={dark} onNext={handleLoginNext} />}
-        {screen === 'consent' && (
-          <ConsentScreen dark={dark} onAccept={handleConsentAccept} creating={creatingClass} error={classError} />
-        )}
-        {screen === 'roster-import' && classId != null && (
-          <RosterImportScreen dark={dark} classId={classId} onImported={handleRosterImported} />
-        )}
-        {screen === 'student-consent' && classId != null && (
-          <StudentConsentScreen dark={dark} classId={classId} roster={roster} onDone={handleConsentDone} />
-        )}
-        {screen === 'home' && (
-          <HomeScreen dark={dark} onNav={handleNav} onScreen={s => setScreen(s)}
-            professorName={professorName} classYear={classYear} periodLabel={periodLabel} />
-        )}
-        {screen === 'registration' && (
-          <RegistrationScreen dark={dark} onBack={() => setScreen('home')}
-            classId={classId} roster={roster} onRegistered={handleStudentRegistered} />
-        )}
-        {screen === 'attendance' && (
-          <AttendanceScreen dark={dark} onBack={() => setScreen('home')} classId={classId} roster={roster} />
-        )}
-        {screen === 'mood' && <MoodScreen dark={dark} onBack={() => { setScreen('home'); setNavTab('home') }} />}
-        {screen === 'reports' && <ReportsScreen dark={dark} classId={classId} onStudent={s => { setSelectedStudent(s); setScreen('report-detail') }} onWeekly={() => setScreen('weekly-report')} />}
-        {screen === 'report-detail' && selectedStudent && <ReportDetailScreen dark={dark} student={selectedStudent} onBack={() => setScreen('reports')} />}
-        {screen === 'weekly-report' && <WeeklyReportScreen dark={dark} onBack={() => setScreen('reports')} />}
-        {screen === 'students' && <StudentsScreen dark={dark} classId={classId} onStudent={s => { setSelectedStudent(s); setScreen('student-detail') }} />}
-        {screen === 'student-detail' && selectedStudent && <StudentDetailScreen dark={dark} student={selectedStudent} onBack={() => setScreen('students')} />}
-        {screen === 'settings' && <SettingsScreen dark={dark} classId={classId} onToggleDark={() => setDark(d => !d)} />}
-      </div>
-
-      {needsNav && !fullscreen && (
-        <BottomNav active={navTab} onNav={handleNav} dark={dark} />
-      )}
-
-      {/* Dark mode FAB on login/consent/setup screens */}
-      {(screen === 'login' || screen === 'consent' || screen === 'roster-import' || screen === 'student-consent') && (
-        <div style={{ position: 'absolute', top: 52, right: 16, zIndex: 10 }}>
-          <button onClick={() => setDark(d => !d)} style={{
-            width: 34, height: 34, borderRadius: 17,
-            background: dark ? '#162535' : '#ffffff',
-            border: `1px solid ${dark ? '#2a4458' : '#d4e4ef'}`,
-            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}>
-            {dark ? icons.sun('#3d84a8') : icons.moon('#3d84a8')}
-          </button>
-        </div>
-      )}
-
-      <style>{`
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.4; }
-        }
-      `}</style>
+      {screenContent}
+      {needsNav && !fullscreen && <BottomNav active={navTab} onNav={handleNav} dark={dark} />}
+      {darkModeFab}
+      <style>{`@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }`}</style>
     </PhoneFrame>
   )
 }
