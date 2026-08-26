@@ -680,7 +680,18 @@ async def mood_frame(session_id: str = Form(...), image: UploadFile = File(...))
     state = mood_sessions[session_id]
     class_id = state.get("class_id")
     loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(_executor, state["monitor"].process_frame, frame, state["frame_counter"], session_id)
+
+    # Hold this session's lock for the whole process_frame() call, so if
+    # the frontend ever sends overlapping requests for the same session
+    # (slow network, retry, multiple tabs), the second call simply waits
+    # its turn instead of racing the first one inside MediaPipe.
+    lock = _mood_session_locks[session_id]
+
+    def _process_locked():
+        with lock:
+            return state["monitor"].process_frame(frame, state["frame_counter"], session_id)
+
+    results = await loop.run_in_executor(_executor, _process_locked)
     state["frame_counter"] += 1
 
     try:
@@ -724,14 +735,27 @@ async def mood_frame(session_id: str = Form(...), image: UploadFile = File(...))
 
     return {"faces": results}
 
+import threading
+
+# Per-session lock so concurrent /api/mood/frame calls for the SAME
+# session_id never run through the same monitor's MediaPipe FaceMesh/
+# FaceDetection objects at once -- MediaPipe's Python API is not
+# thread-safe, and the frontend's MoodScreen capture loop can fire
+# overlapping requests on a slow (Render free tier) backend. This is
+# defense-in-depth alongside the frontend fix (self-pacing capture loop,
+# same pattern AttendanceScreen already uses).
+_mood_session_locks = defaultdict(threading.Lock)
 
 @app.post("/api/mood/end")
 def end_mood_session(session_id: str = Form(...)):
     if session_id not in mood_sessions:
         raise HTTPException(status_code=404, detail="Unknown session_id.")
     mood_sessions.pop(session_id)
+    # Clean up the lock too, or _mood_session_locks (a defaultdict) will
+    # quietly accumulate one Lock object per session forever, for the
+    # lifetime of the process.
+    _mood_session_locks.pop(session_id, None)
     return {"status": "ended", "session_id": session_id}
-
 
 # ─── Lesson segments ────────────────────────────────────────────────────────
 
