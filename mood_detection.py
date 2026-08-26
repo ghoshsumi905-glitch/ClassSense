@@ -73,6 +73,18 @@ FIXES IN THIS REVISION (see chat for the full writeup):
    pose is confidently NOT front-facing. That branch now leans
    "distracted" instead, with lower confidence than the
    both-signals-agree "looking_away" case above it.
+4. CRASH FIX -- _resolve_identity() now coerces whatever
+   attendance_system.recognize_face()/recognize_faces() returns to a
+   plain string (or None) before storing it in track["name"]. That
+   value is used as a dict key everywhere in this class
+   (person_down_since, person_baseline, attentiveness_state,
+   mood_state, person_emotion_history, etc.). Found via a live Render
+   traceback: attendance_system's recognizer was returning a dict
+   (e.g. {"name": ..., "confidence": ...}) in some code path instead
+   of a plain string, and the first downstream dict-key assignment
+   (self.person_down_since[name] = None inside _track_phone_use)
+   threw "TypeError: unhashable type: 'dict'" -- another 500 that the
+   browser misreported as a CORS block, same failure mode as fix #1.
 --------------------------------------------------------------------
 """
 
@@ -500,6 +512,23 @@ class ExtendedMoodClassroomMonitor:
                     recognized = names[0] if names else None
             except Exception:
                 recognized = None
+
+            # DEFENSIVE NORMALIZATION -- attendance_system's recognizer can
+            # return a dict (e.g. {"name": "...", "confidence": ...}) instead
+            # of a plain string in some code paths. Every value stored in
+            # track["name"] is later used as a dict key all over this class
+            # (person_down_since, person_baseline, attentiveness_state,
+            # mood_state, person_emotion_history, etc.), and a dict is
+            # unhashable -- that's what was crashing _track_phone_use with
+            # "TypeError: unhashable type: 'dict'" (a 500 on
+            # /api/mood/frame, which the browser then misreports as a CORS
+            # block). Coerce to a plain string here, once, instead of
+            # guarding every downstream dict-key usage individually.
+            if isinstance(recognized, dict):
+                recognized = recognized.get("name") or recognized.get("label") or None
+            elif recognized is not None and not isinstance(recognized, str):
+                recognized = str(recognized)
+
             if recognized and recognized != "Unknown":
                 track["name"] = recognized
                 track["resolved"] = True
