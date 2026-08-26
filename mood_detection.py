@@ -251,6 +251,19 @@ class ExtendedMoodClassroomMonitor:
         self.phone_pitch_threshold_deg = phone_pitch_threshold_deg
         self.phone_use_duration_seconds = phone_use_duration_seconds
         self.person_down_since = {}
+        # Smoothed pitch per student -- raw per-frame pitch is noisy
+        # (landmark jitter, small natural head movement), which can flip
+        # "looking down" on/off frame-to-frame even during genuine
+        # sustained phone use.
+        self.person_pitch_smoothed = {}
+        self.PHONE_PITCH_SMOOTH_ALPHA = 0.4
+        # How many consecutive NOT-looking-down frames are tolerated
+        # before the accumulated "down" timer resets. Without this, one
+        # brief glance up (or one low-confidence pose frame) wipes out
+        # several seconds of genuine sustained down-time and the alert
+        # never fires.
+        self.PHONE_GRACE_FRAMES = 3
+        self.person_down_grace = {}
 
         # ---- live engagement timeline / insight state (one instance = one live session) ----
         self.session_start_time = time.time()
@@ -339,15 +352,41 @@ class ExtendedMoodClassroomMonitor:
     def _track_phone_use(self, name, pitch, direction_confidence):
         now = time.time()
         trustworthy = direction_confidence >= self.head_pose_confidence_floor
-        looking_down = trustworthy and pitch is not None and pitch > self.phone_pitch_threshold_deg
+
+        # Smooth pitch per student (EMA) so single-frame noise doesn't
+        # flip the looking-down decision. Only smooth when the pose is
+        # actually trustworthy -- a noisy/low-confidence reading shouldn't
+        # pull the smoothed value around.
+        if trustworthy and pitch is not None:
+            prev = self.person_pitch_smoothed.get(name)
+            smoothed_pitch = pitch if prev is None else (
+                self.PHONE_PITCH_SMOOTH_ALPHA * pitch + (1 - self.PHONE_PITCH_SMOOTH_ALPHA) * prev
+            )
+            self.person_pitch_smoothed[name] = smoothed_pitch
+        else:
+            smoothed_pitch = self.person_pitch_smoothed.get(name)
+
+        looking_down = trustworthy and smoothed_pitch is not None and smoothed_pitch > self.phone_pitch_threshold_deg
 
         if looking_down:
+            self.person_down_grace[name] = 0
             if self.person_down_since.get(name) is None:
                 self.person_down_since[name] = now
             elapsed = now - self.person_down_since[name]
         else:
-            self.person_down_since[name] = None
-            elapsed = 0.0
+            grace_used = self.person_down_grace.get(name, 0) + 1
+            self.person_down_grace[name] = grace_used
+            down_since = self.person_down_since.get(name)
+            if down_since is not None and grace_used <= self.PHONE_GRACE_FRAMES:
+                # Brief interruption (glance up, one noisy frame) -- keep
+                # the accumulated timer running rather than resetting it.
+                elapsed = now - down_since
+            else:
+                # Sustained recovery past the grace window -- genuinely
+                # stopped looking down, reset for real.
+                self.person_down_since[name] = None
+                self.person_down_grace[name] = 0
+                elapsed = 0.0
 
         return elapsed >= self.phone_use_duration_seconds, round(elapsed, 1)
 
