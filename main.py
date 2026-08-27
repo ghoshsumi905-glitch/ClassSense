@@ -41,11 +41,28 @@ CHANGELOG (this revision):
     field (ConsentPayload only has consent_status) -- would have thrown
     an AttributeError -> 500 if it were ever reachable. Deleted the
     duplicate rather than leave a landmine in the file.
+  - BUGFIX (attendance export): /api/classes/{class_id}/export/sis was
+    marking every student "Present" based on consent_status (whether
+    they'd consented to biometric tracking) instead of whether the camera
+    actually matched them that day. It's now sourced from attendance.csv
+    (the real log AttendanceSystem writes from face-recognition matches
+    and the finalize_session absentee sweep), filtered by class_id and
+    today's date. attendance_frame/end_attendance_session now also pass
+    class_id through to AttendanceSystem so every row in attendance.csv
+    is attributable to a class -- previously class_id was accepted by
+    those AttendanceSystem methods but never actually forwarded from
+    here, so it was always writing None.
 
 STILL BLOCKED: recognition confidence scores + review queue + manual
 correction (the "uncertain match" workflow) depend entirely on
 attendance_system.py's recognition internals, which haven't been shared
 yet. Nothing here should be read as that being done -- it isn't started.
+
+KNOWN GAP: attendance.csv is local-disk CSV, same durability problem
+faces/mood events had before they moved to Postgres. Render's free tier
+wipes local disk on redeploy, so attendance history won't survive a
+redeploy until this is migrated to a DB table (see docstring in
+attendance_system.py). Not done in this revision.
 """
 import os
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
@@ -431,8 +448,13 @@ async def attendance_frame(session_id: str = Form(...), image: UploadFile = File
     # Offloaded to the thread pool -- face_recognition is CPU-heavy and
     # blocking; running it inline on the event loop freezes every other
     # request on the server while it runs.
+    # class_id is now passed through so every attendance.csv row written
+    # from this frame is attributable to a specific class (previously
+    # AttendanceSystem accepted class_id but this call never forwarded
+    # it, so rows were always written with class_id=None).
     result = await loop.run_in_executor(
-        _executor, attendance_system.process_attendance_frame, frame, session["marked"], session_id
+        _executor, attendance_system.process_attendance_frame,
+        frame, session["marked"], session_id, session.get("class_id")
     )
     return result
 
@@ -457,7 +479,11 @@ def end_attendance_session(session_id: str = Form(...)):
     if session_id not in attendance_sessions:
         raise HTTPException(status_code=404, detail="Unknown session_id.")
     session = attendance_sessions.pop(session_id)
-    summary = attendance_system.finalize_session(session["marked"], session_id)
+    # class_id passed through so absentee rows written here are
+    # attributable to the class too, same reasoning as attendance_frame above.
+    summary = attendance_system.finalize_session(
+        session["marked"], session_id, class_id=session.get("class_id")
+    )
 
     started_at = session.get("started_at")
     automated_seconds = (datetime.utcnow() - started_at).total_seconds() if started_at else None
@@ -1098,10 +1124,29 @@ import csv as csv_module
 
 @app.get("/api/classes/{class_id}/export/sis")
 def export_sis_csv(class_id: int):
-    """Mock SIS-compatible attendance export. Generic Name/Date/Status/Class
-    schema -- not a real vendor integration, but a believable stand-in for
-    'syncs to the school's existing system' until a specific SIS/format is
-    chosen."""
+    """Real SIS-style attendance export.
+
+    BEFORE this revision, this endpoint marked every student "Present" if
+    their consent_status wasn't "pending" -- i.e. it reflected whether a
+    student had CONSENTED to biometric tracking, not whether the camera
+    ever actually detected/matched them that day. That's why the exported
+    CSV showed every enrolled, consented student as Present regardless of
+    real attendance.
+
+    NOW: status is sourced from attendance.csv, the ground-truth log
+    AttendanceSystem writes -- "Present" rows come from actual
+    face-recognition matches during the session (process_attendance_frame),
+    and finalize_session() sweeps every registered-but-unmatched student
+    into an "Absent" row at session end. This export just reads today's
+    rows for this class_id straight out of that log:
+      - name appears with Status=Present in today's rows for this class
+          -> "Present"
+      - student opted out of biometric tracking (consent_status ==
+        "non_biometric") -> "Manual" (they were never going to be matched
+        by the camera by design, so Absent would be misleading)
+      - anything else (registered but never matched, or no session run
+        yet today) -> "Absent"
+    """
     _require_db()
     db = SessionLocal()
     try:
@@ -1112,12 +1157,33 @@ def export_sis_csv(class_id: int):
     finally:
         db.close()
 
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Pull today's "Present" rows for this class from the real attendance log.
+    present_today = set()
+    if os.path.isfile(attendance_system.attendance_file):
+        att_df = pd.read_csv(attendance_system.attendance_file)
+        if not att_df.empty and "ClassId" in att_df.columns:
+            # ClassId is written as "" for legacy/unscoped rows -- coerce to
+            # numeric so the comparison below doesn't silently no-op.
+            att_df["ClassId"] = pd.to_numeric(att_df["ClassId"], errors="coerce")
+            todays = att_df[
+                (att_df["Date"] == today)
+                & (att_df["ClassId"] == class_id)
+                & (att_df["Status"] == "Present")
+            ]
+            present_today = set(todays["Name"].astype(str).str.lower())
+
     buf = io.StringIO()
     writer = csv_module.writer(buf)
     writer.writerow(["StudentName", "Date", "ClassYear", "Period", "Status"])
-    today = datetime.utcnow().strftime("%Y-%m-%d")
     for s in students:
-        status = "Present" if s.consent_status != "pending" else "Unknown"
+        if s.consent_status == "non_biometric":
+            status = "Manual"
+        elif s.name.lower() in present_today:
+            status = "Present"
+        else:
+            status = "Absent"
         writer.writerow([s.name, today, cls.class_year, cls.period_label or "", status])
     buf.seek(0)
     return StreamingResponse(

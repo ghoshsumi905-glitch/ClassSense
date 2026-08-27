@@ -23,6 +23,18 @@ encodings are stored in the same Postgres database as everything else (via
 DB_URL, e.g. a free Neon/Supabase instance) using SQLAlchemy Core -- this
 survives redeploys, unlike local disk. If DB_URL isn't set, this falls back
 to the original filesystem-based "registered_faces" folder behavior.
+
+ATTENDANCE ROW CLASS_ID UPDATE (this revision):
+_append_attendance_row / process_attendance_frame / finalize_session now
+all thread class_id through to every row written to attendance.csv. Before
+this, a "Present"/"Absent" row only had Name/Date/Time/Status/SessionId --
+with multiple classes in play there was no reliable way to tell which
+class a row belonged to, and the SIS export in main.py was falling back to
+consent_status instead of real attendance data as a result. Note this is
+still CSV-on-local-disk, which Render's free tier wipes on redeploy --
+same durability gap that made faces/mood events move to Postgres. Worth
+doing the same migration here (an AttendanceRecord table) before relying
+on this for real cross-day history.
 """
 
 import os
@@ -261,7 +273,7 @@ class AttendanceSystem:
 
     # ---------- attendance logging ----------
 
-    def _append_attendance_row(self, name, status, session_id=None):
+    def _append_attendance_row(self, name, status, session_id=None, class_id=None):
         now = datetime.now()
         row = {
             "Name": name,
@@ -269,6 +281,7 @@ class AttendanceSystem:
             "Time": now.time().strftime("%H:%M:%S"),
             "Status": status,
             "SessionId": session_id or "",
+            "ClassId": class_id if class_id is not None else "",
         }
         file_exists = os.path.isfile(self.attendance_file)
         pd.DataFrame([row]).to_csv(self.attendance_file, mode="a", header=not file_exists, index=False)
@@ -283,7 +296,7 @@ class AttendanceSystem:
         uncertain = []
         for m in matches:
             if m["status"] == "matched" and m["name"] and m["name"] not in marked_students:
-                self._append_attendance_row(m["name"], "Present", session_id)
+                self._append_attendance_row(m["name"], "Present", session_id, class_id=class_id)
                 marked_students.add(m["name"])
                 newly.append({"name": m["name"], "confidence": m["confidence"]})
             elif m["status"] == "uncertain":
@@ -303,5 +316,5 @@ class AttendanceSystem:
             all_registered = set(self.known_face_names)
         absentees = all_registered - marked_students
         for absent_student in absentees:
-            self._append_attendance_row(absent_student, "Absent", session_id)
+            self._append_attendance_row(absent_student, "Absent", session_id, class_id=class_id)
         return {"present": sorted(marked_students), "absent": sorted(absentees)}
