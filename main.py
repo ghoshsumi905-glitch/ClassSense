@@ -304,7 +304,7 @@ def import_roster(class_id: int, payload: RosterImportPayload):
             existing = db.query(Student).filter(Student.class_id == class_id, Student.name == name).first()
             if existing:
                 continue
-            db.add(Student(class_id=class_id, name=name, consent_status="pending", face_registered=False))
+            db.add(Student(class_id=class_id, name=name, consent_status="biometric", face_registered=False))
             created.append(name)
         db.commit()
         return {"class_id": class_id, "imported": created, "skipped_existing": len(payload.names) - len(created)}
@@ -412,7 +412,7 @@ async def register_student(name: str = Form(...), images: List[UploadFile] = Fil
         try:
             s = db.query(Student).filter(Student.class_id == class_id, Student.name == name).first()
             if not s:
-                s = Student(class_id=class_id, name=name, consent_status="pending", face_registered=False)
+                s = Student(class_id=class_id, name=name, consent_status="biometric", face_registered=False)
                 db.add(s)
             s.face_registered = True
             db.commit()
