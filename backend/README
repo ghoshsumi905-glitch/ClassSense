@@ -1,0 +1,138 @@
+# ClassSense Backend — Setup & Deployment Guide
+
+## What changed from your original scripts
+
+Your original `attendance_system.py` / `mood_detection.py` opened your
+laptop's webcam directly (`cv2.VideoCapture(0)`) and displayed results in
+a local window (`cv2.imshow`). A server has neither. These adapted
+versions keep **100% of your detection logic** (face matching, attention
+scoring, mood scoring, calibration, tracking) but swap the frame source:
+instead of a local camera loop, each function now takes one frame at a
+time and returns JSON. The FastAPI layer (`main.py`) is what receives
+frames sent over the network from the browser and calls your logic on them.
+
+---
+
+## Step 1 — Test it locally first
+
+```bash
+cd classsense-backend
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+**Heads up:** `dlib` (needed by `face_recognition`) compiles from source
+and can take 10–20 minutes. If it fails, you're likely missing CMake or a
+C++ compiler — on Windows, install "Visual Studio Build Tools" first, or
+just skip local install and go straight to Docker (Step 3), which handles
+this for you.
+
+Run the server:
+```bash
+uvicorn main:app --reload --port 8000
+```
+
+Open `http://localhost:8000/api/health` — you should see `{"status":"ok"}`.
+Open `http://localhost:8000/docs` — FastAPI's interactive API explorer,
+where you can test every endpoint by hand before wiring up the frontend.
+
+---
+
+## Step 2 — Wire it into your React frontend
+
+Your `App.tsx` currently has zero real camera access. You'll need to:
+
+1. In `RegistrationScreen`, `AttendanceScreen`, and `MoodScreen`, replace
+   the fake camera `<div>` with a real `<video>` element fed by:
+   ```js
+   const stream = await navigator.mediaDevices.getUserMedia({ video: true })
+   videoRef.current.srcObject = stream
+   ```
+2. Periodically (e.g. every 500ms–1s) grab a frame from the video onto a
+   `<canvas>`, convert it to a JPEG blob, and POST it to your backend:
+   ```js
+   canvas.toBlob(async (blob) => {
+     const form = new FormData()
+     form.append('session_id', sessionId)
+     form.append('image', blob, 'frame.jpg')
+     const res = await fetch(`${API_URL}/api/mood/frame`, { method: 'POST', body: form })
+     const data = await res.json()
+     // use data.faces to draw real boxes instead of the hardcoded `detections` array
+   }, 'image/jpeg')
+   ```
+3. Replace the hardcoded `STUDENTS` array with a `fetch(`${API_URL}/api/students`)` call.
+
+I can build this React integration next once your backend is deployed and
+you have a live API URL to point it at.
+
+---
+
+## Step 3 — Deploy the backend (Render, using Docker)
+
+Render is a good fit here because your free-form `Dockerfile` handles the
+dlib/cmake system dependencies that a plain buildpack can't.
+
+1. Push this `classsense-backend` folder to its own GitHub repo (separate
+   from your frontend repo).
+2. Go to https://dashboard.render.com → **New** → **Web Service**.
+3. Connect the GitHub repo.
+4. Render should auto-detect the `Dockerfile`. If asked:
+   - **Environment**: Docker
+   - **Instance type**: at minimum "Starter" (512MB free tier will likely
+     be too small once DeepFace + MediaPipe are both loaded — expect to
+     need 2GB+ for smooth operation)
+5. Deploy. First build will be slow (dlib compiling) — expect 15–25 minutes.
+6. Once live, you'll get a URL like `https://classsense-api.onrender.com`.
+   Test `https://classsense-api.onrender.com/api/health`.
+
+**Persistent storage note:** Render's free/starter disks are ephemeral —
+registered face images and CSV logs will be wiped on redeploy. For real
+use, add a Render persistent disk, or (better, long-term) move
+`registered_faces/` to cloud storage (e.g. S3/Supabase Storage) and swap
+the CSV logging for real database writes.
+
+---
+
+## Step 4 — Connect frontend to backend
+
+In your Vercel project, add an environment variable:
+```
+VITE_API_URL=https://classsense-api.onrender.com
+```
+Then in your React code, reference `import.meta.env.VITE_API_URL` instead
+of a hardcoded `localhost`. Redeploy the Vercel frontend.
+
+Also tighten CORS in `main.py` — currently `allow_origins=["*"]` for easy
+testing; change it to your real Vercel URL before going live:
+```python
+allow_origins=["https://class-sense-prototype.vercel.app"]
+```
+
+---
+
+## Step 5 — Add a real database (recommended next step)
+
+Right now, attendance/mood data lives in local CSV files
+(`attendance.csv`, `cognitive_load_log.csv`) — fine for one classroom on
+one server, but won't survive redeploys or scale to multiple
+teachers/schools. Recommended: Supabase (hosted Postgres, generous free
+tier, has a simple Python client). I can help design the schema
+(`students`, `sessions`, `attendance_records`, `mood_logs`) and swap the
+CSV writes for real DB writes once the current flow is working end-to-end.
+
+---
+
+## Realistic expectations
+
+- **Face recognition accuracy**: `face_recognition` (dlib-based) is solid
+  for small classes (~20-30 students) with decent lighting/camera angle.
+  Expect some false "Unknown" results at steep angles or poor lighting.
+- **Speed**: DeepFace emotion analysis is the slowest step. Running it
+  every frame will lag; the code already only runs it every
+  `detector_frame_interval` (8) frames — tune this up if it's too slow on
+  your server's CPU.
+- **This is a monitoring/flagging tool, not a diagnostic one** — this is
+  already baked into your `mood_detection.py` docstring and
+  `session_report.py` flagging language, and it's the right call to keep
+  it that way.

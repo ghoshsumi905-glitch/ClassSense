@@ -1,0 +1,8 @@
+﻿venv/
+__pycache__/
+*.pyc
+registered_faces/
+attendance.csv
+cognitive_load_log.csv
+session_reports/
+install_log.txt
