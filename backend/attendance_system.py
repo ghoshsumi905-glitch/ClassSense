@@ -286,6 +286,17 @@ class AttendanceSystem:
         file_exists = os.path.isfile(self.attendance_file)
         pd.DataFrame([row]).to_csv(self.attendance_file, mode="a", header=not file_exists, index=False)
 
+    def recognize_face(self, frame, class_id=None):
+        """Convenience single-best-match wrapper around recognize_faces(),
+        for callers (like mood_detection.py) that only care about one name
+        per crop rather than the full structured match list. Returns the
+        matched/uncertain name, or None if nothing usable was found."""
+        matches = self.recognize_faces(frame, class_id=class_id)
+        if not matches:
+            return None
+        m = matches[0]
+        return m.get("name")
+
     def process_attendance_frame(self, frame, marked_students, session_id=None, class_id=None):
         """Process a frame containing potentially multiple faces.
         Auto-marks "matched" faces as Present. "uncertain" faces are
