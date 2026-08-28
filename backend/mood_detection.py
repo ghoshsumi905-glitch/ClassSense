@@ -53,38 +53,29 @@ FIXES IN THIS REVISION (see chat for the full writeup):
 1. CRASH FIX -- _update_smoothed_emotions() now normalizes the raw
    dict returned by predict_emotion_full() to this class's exact
    emotion_keys set (missing keys filled with 0.0) before it's ever
-   stored in person_emotion_history. Previously, on a person's first
-   successful emotion read, the RAW external dict was stored as-is,
-   and process_frame()'s entropy calculation indexed it with
-   smoothed[k] (no .get()). If predict_emotion_full()'s key set ever
-   drifted from self.emotion_keys -- different casing, a renamed
-   label, a class missing on a given frame -- that line threw an
-   uncaught KeyError, which FastAPI turns into a 500. Starlette
-   generates that 500 from outside the CORS middleware, so it shows
-   up in the browser as a misleading "blocked by CORS policy" error
-   instead of the real cause. process_frame() also now reads
-   smoothed with .get(k, 0.0) as a second line of defense.
+   stored in person_emotion_history.
 2. _detect_faces() now guards against a None/empty frame instead of
    throwing on frame_bgr.shape.
 3. ATTENTIVENESS SCORING FIX -- the "head turned away, but gaze not
-   confirmed away" branch in _score_attentiveness() was scoring
-   "attentive" as the dominant label (70/20/10 split favoring
-   attentive), which is backwards: head_away is only True when head
-   pose is confidently NOT front-facing. That branch now leans
-   "distracted" instead, with lower confidence than the
-   both-signals-agree "looking_away" case above it.
+   confirmed away" branch in _score_attentiveness() now leans
+   "distracted" instead of "attentive" (head_away is only True when
+   head pose is confidently NOT front-facing, so "attentive" there
+   was backwards).
 4. CRASH FIX -- _resolve_identity() now coerces whatever
    attendance_system.recognize_face()/recognize_faces() returns to a
-   plain string (or None) before storing it in track["name"]. That
-   value is used as a dict key everywhere in this class
-   (person_down_since, person_baseline, attentiveness_state,
-   mood_state, person_emotion_history, etc.). Found via a live Render
-   traceback: attendance_system's recognizer was returning a dict
-   (e.g. {"name": ..., "confidence": ...}) in some code path instead
-   of a plain string, and the first downstream dict-key assignment
-   (self.person_down_since[name] = None inside _track_phone_use)
-   threw "TypeError: unhashable type: 'dict'" -- another 500 that the
-   browser misreported as a CORS block, same failure mode as fix #1.
+   plain string (or None) before storing it in track["name"].
+5. CLASS-SCOPING FIX (this revision) -- process_frame() now accepts
+   class_id and threads it through to _resolve_identity() and on to
+   AttendanceSystem's recognize_face()/recognize_faces(). Previously
+   this was always called with class_id=None (implicitly, since the
+   parameter didn't exist), which -- per the class-scoped faces model
+   in attendance_system.py -- filtered the recognition pool down to
+   ONLY unscoped/legacy face rows. Any student registered under a real
+   class_id (i.e. everyone, under the current roster/consent workflow)
+   was therefore unrecognizable during Mood Monitor sessions and would
+   show up as "Unknown" for the whole session, regardless of whether
+   their face was actually registered. main.py's /api/mood/frame now
+   passes class_id through from the session's stored value.
 --------------------------------------------------------------------
 """
 
@@ -111,19 +102,11 @@ CHANGELOG (this revision):
     unrecognized students in the same session don't get their
     calibration/state mixed together), but the NAME WRITTEN TO THE
     LOG AND RETURNED TO THE FRONTEND is now a single flat "Unknown"
-    instead of "Unknown-0", "Unknown-3", etc. Previously every
-    unresolved track minted its own permanent pseudo-student, which
-    polluted per-name grouping in session_report.py and the reports
-    endpoints in main.py.
+    instead of "Unknown-0", "Unknown-3", etc.
   - Live engagement timeline + insight: the monitor now accumulates
     per-minute engagement (100 - cognitive_load) for identified
-    students while a session is live, and exposes get_live_insight()
-    -- a chart-ready timeline plus a short rule-based narrative for
-    the in-progress session, in the same spirit as the AI Weekly
-    Report's narrative in main.py (states only numbers actually
-    computed from this session, never a diagnostic label). Wire this
-    up to a new `/api/mood/insight?session_id=...` endpoint in
-    main.py that calls `mood_sessions[session_id]["monitor"].get_live_insight()`.
+    students while a session is live, and exposes get_live_insight().
+  - class_id threading (see FIXES #5 above).
 """
 
 import time
@@ -349,6 +332,7 @@ class ExtendedMoodClassroomMonitor:
             return direction, confidence, yaw, pitch
         except Exception:
             return "UNKNOWN", 0.0, 0.0, 0.0
+
     def _track_phone_use(self, name, pitch, direction_confidence):
         now = time.time()
         trustworthy = direction_confidence >= self.head_pose_confidence_floor
@@ -524,7 +508,7 @@ class ExtendedMoodClassroomMonitor:
 
         return list(zip(assignments, boxes))
 
-    def _resolve_identity(self, track_id, face_crop):
+    def _resolve_identity(self, track_id, face_crop, class_id=None):
         """Returns the INTERNAL identity key for this track -- either the
         recognized student's name, or a per-track placeholder like
         "Unknown-3". This key is deliberately kept unique per track (not
@@ -535,7 +519,12 @@ class ExtendedMoodClassroomMonitor:
 
         Anything that goes to the FRONTEND or the CSV LOG should instead use
         `_display_name()` below, which buckets every unresolved track down
-        to a flat "Unknown" so reports don't get one row-group per track."""
+        to a flat "Unknown" so reports don't get one row-group per track.
+
+        class_id is forwarded to AttendanceSystem so the recognition pool is
+        the right class's registered faces -- see FIXES #5 in the module
+        docstring for why this matters. class_id=None still works for
+        legacy/unscoped face rows, same as before."""
         track = self.tracks[track_id]
         track["frames_seen"] += 1
         due_for_recheck = track["resolved"] and (track["frames_seen"] % self.reverify_interval == 0)
@@ -544,11 +533,23 @@ class ExtendedMoodClassroomMonitor:
             try:
                 # Backward-compatible path: prefer single-face API if present.
                 if hasattr(self.attendance, "recognize_face"):
-                    recognized = self.attendance.recognize_face(face_crop)
+                    recognized = self.attendance.recognize_face(face_crop, class_id=class_id)
                 else:
                     # Newer AttendanceSystem exposes recognize_faces().
-                    names = self.attendance.recognize_faces(face_crop)
+                    names = self.attendance.recognize_faces(face_crop, class_id=class_id)
                     recognized = names[0] if names else None
+            except TypeError:
+                # Older AttendanceSystem builds without class_id support on
+                # these methods -- fall back to the unscoped call rather
+                # than crashing the whole frame.
+                try:
+                    if hasattr(self.attendance, "recognize_face"):
+                        recognized = self.attendance.recognize_face(face_crop)
+                    else:
+                        names = self.attendance.recognize_faces(face_crop)
+                        recognized = names[0] if names else None
+                except Exception:
+                    recognized = None
             except Exception:
                 recognized = None
 
@@ -830,11 +831,15 @@ class ExtendedMoodClassroomMonitor:
 
     # ---------- THE NEW PUBLIC ENTRY POINT: one frame in, JSON out ----------
 
-    def process_frame(self, frame, frame_counter, session_id=None, run_emotion_model=True):
+    def process_frame(self, frame, frame_counter, session_id=None, class_id=None, run_emotion_model=True):
         """Replaces the body of the old run_monitoring_session while-loop.
         Call this once per frame the browser sends. Returns a list of dicts
         (one per detected face) that the frontend uses to draw boxes/bars,
-        plus appends log rows exactly like the desktop version did."""
+        plus appends log rows exactly like the desktop version did.
+
+        class_id is forwarded to _resolve_identity() so recognition matches
+        against the right class's registered faces -- see FIXES #5 in the
+        module docstring."""
         faces = self._detect_faces(frame)
         tracked_faces = self._match_faces_to_tracks(faces)
         results = []
@@ -851,7 +856,7 @@ class ExtendedMoodClassroomMonitor:
             # `name` is the internal identity key (e.g. "Unknown-3") used for
             # per-track calibration/state below. `display_name` is what
             # actually reaches the frontend and the CSV log.
-            name = self._resolve_identity(track_id, face_crop)
+            name = self._resolve_identity(track_id, face_crop, class_id=class_id)
             display_name = self._display_name(name)
             landmarks = self._extract_landmarks_for_crop(face_crop)
 
