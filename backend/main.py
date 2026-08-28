@@ -707,7 +707,10 @@ async def mood_frame(session_id: str = Form(...), image: UploadFile = File(...))
 
     def _process_locked():
         with lock:
-            return state["monitor"].process_frame(frame, state["frame_counter"], session_id)
+            # class_id passed through so recognition matches against this
+            # class's registered faces, not just unscoped/legacy rows --
+            # see FIXES #5 in mood_detection.py's module docstring.
+            return state["monitor"].process_frame(frame, state["frame_counter"], session_id, class_id=class_id)
 
     results = await loop.run_in_executor(_executor, _process_locked)
     state["frame_counter"] += 1
