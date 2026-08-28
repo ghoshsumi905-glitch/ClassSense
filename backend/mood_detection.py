@@ -76,6 +76,16 @@ FIXES IN THIS REVISION (see chat for the full writeup):
    show up as "Unknown" for the whole session, regardless of whether
    their face was actually registered. main.py's /api/mood/frame now
    passes class_id through from the session's stored value.
+6. IDENTITY CONFIRMATION FIX -- _resolve_identity() previously locked
+   in a track's identity from a SINGLE recognize_faces() call, with
+   no confirmation, unlike attentiveness/mood which both require 4
+   consistent frames via _decide_label(). One noisy frame (bad angle,
+   motion blur, partial occlusion) could permanently mislabel a
+   student for up to reverify_interval (150) frames. Now requires
+   IDENTITY_CONFIRMATION_REQUIRED (3) consecutive "matched"-status
+   recognitions of the SAME name before committing -- the main fix
+   for reported cross-student misidentification (e.g. Sumi/Koyel
+   confusion).
 --------------------------------------------------------------------
 """
 
@@ -217,6 +227,15 @@ class ExtendedMoodClassroomMonitor:
         self.max_track_miss = 20
         self.track_match_radius_factor = 0.7
         self.reverify_interval = 150
+        # How many consecutive "matched" (not "uncertain") recognitions of
+        # THE SAME name are required before a track's identity is trusted.
+        # Previously identity was locked in from a single recognize_faces()
+        # call, with no confirmation -- unlike attentiveness/mood, which
+        # both require 4 consistent frames via _decide_label(). One noisy
+        # frame (bad angle, motion blur, partial occlusion) could
+        # permanently mislabel a student for up to reverify_interval
+        # frames. This mirrors that same hysteresis pattern for identity.
+        self.IDENTITY_CONFIRMATION_REQUIRED = 3
 
         self._log_header = ["Name", "Attentiveness", "AttConf", "Mood", "MoodConf",
                              "CognitiveLoad", "PERCLOS", "Timestamp", "SessionId"]
@@ -496,6 +515,7 @@ class ExtendedMoodClassroomMonitor:
                 self.tracks[new_id] = {
                     "centroid": (cx, cy), "width": w, "name": None,
                     "resolved": False, "miss_count": 0, "frames_seen": 0,
+                    "candidate_name": None, "candidate_count": 0,
                 }
                 assignments[i] = new_id
 
@@ -509,73 +529,71 @@ class ExtendedMoodClassroomMonitor:
         return list(zip(assignments, boxes))
 
     def _resolve_identity(self, track_id, face_crop, class_id=None):
-        """Returns the INTERNAL identity key for this track -- either the
-        recognized student's name, or a per-track placeholder like
-        "Unknown-3". This key is deliberately kept unique per track (not
-        collapsed to a single "Unknown") because it's used everywhere below
-        to key calibration buffers and attentiveness/mood state machines --
-        collapsing it here would mix two different unrecognized students'
-        baselines and hysteresis state together.
+   
+     track = self.tracks[track_id]
+     track["frames_seen"] += 1
+     due_for_recheck = track["resolved"] and (track["frames_seen"] % self.reverify_interval == 0)
 
-        Anything that goes to the FRONTEND or the CSV LOG should instead use
-        `_display_name()` below, which buckets every unresolved track down
-        to a flat "Unknown" so reports don't get one row-group per track.
-
-        class_id is forwarded to AttendanceSystem so the recognition pool is
-        the right class's registered faces -- see FIXES #5 in the module
-        docstring for why this matters. class_id=None still works for
-        legacy/unscoped face rows, same as before."""
-        track = self.tracks[track_id]
-        track["frames_seen"] += 1
-        due_for_recheck = track["resolved"] and (track["frames_seen"] % self.reverify_interval == 0)
-
-        if not track["resolved"] or due_for_recheck:
+     if not track["resolved"] or due_for_recheck:
+        match = None
+        try:
+            matches = self.attendance.recognize_faces(face_crop, class_id=class_id)
+            match = matches[0] if matches else None
+        except TypeError:
+            # Older AttendanceSystem builds without class_id support --
+            # fall back to the unscoped call rather than crashing the frame.
             try:
-                # Backward-compatible path: prefer single-face API if present.
-                if hasattr(self.attendance, "recognize_face"):
-                    recognized = self.attendance.recognize_face(face_crop, class_id=class_id)
-                else:
-                    # Newer AttendanceSystem exposes recognize_faces().
-                    names = self.attendance.recognize_faces(face_crop, class_id=class_id)
-                    recognized = names[0] if names else None
-            except TypeError:
-                # Older AttendanceSystem builds without class_id support on
-                # these methods -- fall back to the unscoped call rather
-                # than crashing the whole frame.
-                try:
-                    if hasattr(self.attendance, "recognize_face"):
-                        recognized = self.attendance.recognize_face(face_crop)
-                    else:
-                        names = self.attendance.recognize_faces(face_crop)
-                        recognized = names[0] if names else None
-                except Exception:
-                    recognized = None
+                matches = self.attendance.recognize_faces(face_crop)
+                match = matches[0] if matches else None
             except Exception:
-                recognized = None
+                match = None
+        except Exception:
+            match = None
 
-            # DEFENSIVE NORMALIZATION -- attendance_system's recognizer can
-            # return a dict (e.g. {"name": "...", "confidence": ...}) instead
-            # of a plain string in some code paths. Every value stored in
-            # track["name"] is later used as a dict key all over this class
-            # (person_down_since, person_baseline, attentiveness_state,
-            # mood_state, person_emotion_history, etc.), and a dict is
-            # unhashable -- that's what was crashing _track_phone_use with
-            # "TypeError: unhashable type: 'dict'" (a 500 on
-            # /api/mood/frame, which the browser then misreports as a CORS
-            # block). Coerce to a plain string here, once, instead of
-            # guarding every downstream dict-key usage individually.
-            if isinstance(recognized, dict):
-                recognized = recognized.get("name") or recognized.get("label") or None
-            elif recognized is not None and not isinstance(recognized, str):
-                recognized = str(recognized)
+        recognized, status = None, None
+        if isinstance(match, dict):
+            raw_name = match.get("name") or match.get("label") or None
+            # Coerce to a plain string -- some recognizer builds return
+            # nested structures here; this key ends up in person_baseline,
+            # attentiveness_state, mood_state, etc., all of which need a
+            # hashable, comparable string. (FIXES #4)
+            recognized = str(raw_name) if raw_name is not None else None
+            status = match.get("status")
+        elif match is not None:
+            recognized = match if isinstance(match, str) else str(match)
+            status = "matched"
 
-            if recognized and recognized != "Unknown":
-                track["name"] = recognized
-                track["resolved"] = True
-            elif not track["resolved"]:
-                track["name"] = f"Unknown-{track_id}"
+        if recognized and status == "matched" and recognized != "Unknown":
+            name_taken_elsewhere = any(
+                tid != track_id and t.get("resolved") and t.get("name") == recognized
+                for tid, t in self.tracks.items()
+            )
+            if name_taken_elsewhere:
+                # Someone else already holds this name right now -- don't
+                # let this track steal it. Reset progress rather than
+                # corrupting two tracks' identities.
+                track["candidate_name"], track["candidate_count"] = None, 0
+            else:
+                if track["candidate_name"] == recognized:
+                    track["candidate_count"] += 1
+                else:
+                    track["candidate_name"] = recognized
+                    track["candidate_count"] = 1
 
-        return track["name"]
+                if track["candidate_count"] >= self.IDENTITY_CONFIRMATION_REQUIRED:
+                    track["name"] = recognized
+                    track["resolved"] = True
+                    track["candidate_name"], track["candidate_count"] = None, 0
+        # "uncertain"/"unknown" status: leave the candidate buffer
+        # untouched -- a weak/no match shouldn't reset progress toward a
+        # real match that's already partway confirmed, but shouldn't
+        # count as a vote either way.
+
+        if not track["resolved"] and track["name"] is None:
+            track["name"] = f"Unknown-{track_id}"
+
+     return track["name"]
+
 
     @staticmethod
     def _display_name(internal_name):
