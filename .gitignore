@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 .env
 dist/
+registered_faces/
+attendance.csv
+cognitive_load_log.csv
+session_reports/
+node_modules
+dist
+mood_events.db
