@@ -101,7 +101,11 @@ app = FastAPI(title="ClassSense API")
 # Replace "*" with your actual Vercel URL before going to production.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict to ["https://class-sense-prototype-classsense.vercel.app"]
+    allow_origins=[
+        "https://class-sense-prototype-classsense.vercel.app",
+        "https://class-sense-prototype.vercel.app",
+        "https://localhost:8443",  # matches your actual Vite dev port
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
