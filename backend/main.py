@@ -104,7 +104,9 @@ app.add_middleware(
     allow_origins=[
         "https://class-sense-prototype-classsense.vercel.app",
         "https://class-sense-prototype.vercel.app",
-        "https://localhost:8443",  # matches your actual Vite dev port
+        "http://localhost:5173",
+        "http://localhost:8443",
+        "https://glorious-respect-production-22e3.up.railway.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
